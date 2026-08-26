@@ -1,0 +1,22 @@
+{
+  "Prefix": "{green}[Gamemode]{default}",
+  "NoPermission": "{red}You do not have permission to use this command.{default}",
+  "SwitchInProgress": "{red}A switch is already in progress, please wait.{default}",
+  "Switch.Announce": "{red}{0}{default} is switching the server to {yellow}{1}{default}, map changes in {red}{2}{default}s",
+  "Switch.Countdown": "Switching to <font color='#9acd32'>{0}</font><br>Changing map in {1}s",
+  "Switch.Executing": "Switching to {yellow}{0}{default}, loading map…",
+  "Menu.Title": "Select Game Mode",
+  "Menu.Current": " (current)",
+  "Menu.Control.Move": "Move",
+  "Menu.Control.Select": "Select",
+  "Menu.Control.Back": "Back",
+  "Menu.Control.Exit": "Exit",
+  "Mode.Casual": "Casual",
+  "Mode.Competitive": "Competitive",
+  "Mode.Wingman": "Wingman (2v2)",
+  "Mode.ArmsRace": "Arms Race",
+  "Mode.Demolition": "Demolition",
+  "Mode.Deathmatch": "Deathmatch",
+  "Mode.Training": "Training",
+  "Mode.Custom": "Custom"
+}

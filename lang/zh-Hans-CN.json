@@ -1,0 +1,22 @@
+{
+  "Prefix": "{green}[游戏模式]{default}",
+  "NoPermission": "{red}你没有使用此命令的权限。{default}",
+  "SwitchInProgress": "{red}已在切换流程中，请稍候。{default}",
+  "Switch.Announce": "{red}{0}{default} 将服务器模式切换为 {yellow}{1}{default}，{red}{2}{default} 秒后更换地图",
+  "Switch.Countdown": "即将切换到 <font color='#9acd32'>{0}</font><br>{1} 秒后更换地图",
+  "Switch.Executing": "正在切换到 {yellow}{0}{default}，地图加载中…",
+  "Menu.Title": "选择游戏模式",
+  "Menu.Current": "（当前）",
+  "Menu.Control.Move": "移动",
+  "Menu.Control.Select": "确认",
+  "Menu.Control.Back": "返回",
+  "Menu.Control.Exit": "退出",
+  "Mode.Casual": "休闲模式",
+  "Mode.Competitive": "竞技模式",
+  "Mode.Wingman": "搭档模式（2v2）",
+  "Mode.ArmsRace": "军备竞赛",
+  "Mode.Demolition": "爆破模式",
+  "Mode.Deathmatch": "死亡竞赛",
+  "Mode.Training": "训练模式",
+  "Mode.Custom": "自定义模式"
+}
