@@ -25,19 +25,24 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
     private readonly Dictionary<int, SgMenuState> _menuStates = new();
     private readonly Dictionary<int, float> _savedSpeeds = new();
+    private PendingSwitch? _pendingSwitch;
+    private (int Type, int Mode)? _confirmedMode;
     private bool _switchInProgress;
 
-    private static readonly (string Alias, int Type, int Mode, string LangKey)[] Modes =
+    private static readonly ModeDefinition[] Modes =
     {
-        ("casual",      0, 0, "Mode.Casual"),
-        ("competitive", 0, 1, "Mode.Competitive"),
-        ("wingman",     0, 2, "Mode.Wingman"),
-        ("armsrace",    1, 0, "Mode.ArmsRace"),
-        ("demolition",  1, 1, "Mode.Demolition"),
-        ("deathmatch",  1, 2, "Mode.Deathmatch"),
-        ("training",    2, 0, "Mode.Training"),
-        ("custom",      3, 0, "Mode.Custom"),
+        new("casual",      0, 0, "Mode.Casual",      5, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
+        new("competitive", 0, 1, "Mode.Competitive", 5, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
+        new("wingman",     0, 2, "Mode.Wingman",     2, new[] { "de_debris", "de_eldorado", "de_poseidon", "de_overpass", "de_vertigo", "de_nuke", "de_inferno" }),
+        new("retakes",     0, 5, "Mode.Retakes",      0, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient_night", "de_train", "de_vertigo", "de_overpass" }),
+        new("armsrace",    1, 0, "Mode.ArmsRace",    0, 10, true, new[] { "ar_shoots", "ar_shoots_night", "ar_baggage", "ar_pool_day" }),
+        new("demolition",  1, 1, "Mode.Demolition",  5, new[] { "de_safehouse" }),
+        new("deathmatch",  1, 2, "Mode.Deathmatch",  0, 10, true, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
+        new("training",    2, 0, "Mode.Training",    5, new[] { "de_dust2" }),
+        new("custom",      3, 0, "Mode.Custom",      5, new[] { "de_dust2", "de_mirage", "de_inferno", "de_nuke", "de_overpass", "de_ancient", "de_anubis", "de_vertigo" }),
     };
+
+    private static readonly string[] ModeGroups = { "ModeGroup.Classic", "ModeGroup.Wingman", "ModeGroup.Retakes", "ModeGroup.WarGames", "ModeGroup.Other" };
 
     public void OnConfigParsed(GameModeSwitcherConfig config) => Config = config;
 
@@ -49,6 +54,8 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
         RegisterListener<Listeners.OnTick>(OnMenuTick);
         RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
+        RegisterListener<Listeners.OnMapStart>(OnMapStart);
+        ConfigureKickPunishment();
         Logger.LogInformation("Loaded (version {Version})", ModuleVersion);
     }
 
@@ -68,13 +75,13 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
         if (!AdminManager.PlayerHasPermissions(player, Config.RequiredFlag))
         {
-            player.PrintToChat(Localizer.ForPlayer(player, "Prefix") + Localizer.ForPlayer(player, "NoPermission"));
+            player.PrintToChat(T(player, "Prefix") + T(player, "NoPermission"));
             return;
         }
 
         if (_switchInProgress)
         {
-            player.PrintToChat(Localizer.ForPlayer(player, "Prefix") + Localizer.ForPlayer(player, "SwitchInProgress"));
+            player.PrintToChat(T(player, "Prefix") + T(player, "SwitchInProgress"));
             return;
         }
 
@@ -93,20 +100,23 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         return (type.GetPrimitiveValue<int>(), mode.GetPrimitiveValue<int>());
     }
 
-    private void BeginSwitch(CCSPlayerController initiator, (string Alias, int Type, int Mode, string LangKey) mode)
+    private void BeginSwitch(CCSPlayerController initiator, ModeDefinition mode, MapDefinition map)
     {
         CloseMenu(initiator);
 
         _switchInProgress = true;
         var initiatorName = initiator.PlayerName;
-        var mapName = string.IsNullOrWhiteSpace(Server.MapName) ? "de_dust2" : Server.MapName.Trim();
+        var mapName = map.Name;
         var remaining = Math.Max(0, Config.CountdownSeconds);
 
-        Broadcast(p => Localizer.ForPlayer(p, "Switch.Announce", initiatorName, T(p, mode.LangKey), remaining));
+        var pending = new PendingSwitch(mode, map.Name, BuildBotPlan(mode, Config.ForceBalanceTeams));
+        _pendingSwitch = pending;
+
+        Broadcast(p => T(p, "Switch.Announce", initiatorName, T(p, mode.LangKey), remaining));
 
         void Execute()
         {
-            Broadcast(_ => Localizer.ForPlayer(_, "Switch.Executing", T(_, mode.LangKey)));
+            Broadcast(_ => T(_, "Switch.Executing", T(_, mode.LangKey)));
             _switchInProgress = false;
             Server.ExecuteCommand($"game_alias {mode.Alias}");
             Server.ExecuteCommand($"changelevel {mapName}");
@@ -126,7 +136,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
                 return;
             }
 
-            BroadcastCenter(p => Localizer.ForPlayer(p, "Switch.Countdown", T(p, mode.LangKey), remaining));
+            BroadcastCenter(p => T(p, "Switch.Countdown", T(p, mode.LangKey), remaining));
             remaining--;
             AddTimer(1f, Tick);
         }
@@ -141,24 +151,29 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         if (!player.IsValid)
             return;
 
-        var current = GetCurrentMode();
         var menu = new SgMenu(T(player, "Menu.Title"));
-
-        foreach (var mode in Modes)
+        foreach (var groupKey in ModeGroups)
         {
-            bool isCurrent = current.HasValue
-                && current.Value.Type == mode.Type
-                && current.Value.Mode == mode.Mode;
-
-            var label = T(player, mode.LangKey) + (isCurrent ? T(player, "Menu.Current") : string.Empty);
-            var target = mode;
-            menu.Options.Add(new SgMenuOption(label, p =>
+            var groupModes = Modes.Where(m => m.GroupKey == groupKey).ToArray();
+            if (groupModes.Length == 0)
+                continue;
+            var captured = groupModes;
+            menu.Options.Add(new SgMenuOption(T(player, groupKey), p =>
             {
-                if (isCurrent || _switchInProgress)
-                    return;
-                BeginSwitch(p, target);
-            }, disabled: isCurrent));
+                if (captured.Length == 1)
+                    OpenMapMenu(p, captured[0]);
+                else
+                    OpenModeMenu(p, captured);
+            }));
         }
+
+        OpenMenu(player, menu, resetHistory);
+    }
+
+    private void OpenMenu(CCSPlayerController player, SgMenu menu, bool resetHistory = false)
+    {
+        if (!player.IsValid)
+            return;
 
         var state = GetMenuState(player);
         if (resetHistory)
@@ -173,6 +188,36 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         state.LastInputUtc = state.OpenedAtUtc;
         SetFrozen(player, true);
         RenderMenu(player, state);
+    }
+
+    private void OpenModeMenu(CCSPlayerController player, IReadOnlyList<ModeDefinition> modes)
+    {
+        var menu = new SgMenu(T(player, "Menu.ModeTitle"));
+        foreach (var mode in modes)
+        {
+            var isCurrent = _confirmedMode.HasValue
+                && _confirmedMode.Value.Type == mode.Type
+                && _confirmedMode.Value.Mode == mode.Mode;
+            var target = mode;
+            menu.Options.Add(new SgMenuOption(T(player, mode.LangKey) + (isCurrent ? T(player, "Menu.Current") : string.Empty), p => OpenMapMenu(p, target)));
+        }
+        OpenMenu(player, menu);
+    }
+
+    private void OpenMapMenu(CCSPlayerController player, ModeDefinition mode)
+    {
+        var menu = new SgMenu(T(player, "Menu.MapTitle", T(player, mode.LangKey)));
+        foreach (var mapName in mode.Maps)
+        {
+            var map = new MapDefinition(mapName);
+            var target = mode;
+            menu.Options.Add(new SgMenuOption(T(player, map.LangKey), p =>
+            {
+                if (!_switchInProgress)
+                    BeginSwitch(p, target, map);
+            }));
+        }
+        OpenMenu(player, menu);
     }
 
     private SgMenuState GetMenuState(CCSPlayerController player)
@@ -190,6 +235,83 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     {
         _menuStates.Remove(slot);
         _savedSpeeds.Remove(slot);
+    }
+
+    private void OnMapStart(string mapName)
+    {
+        ConfigureKickPunishment();
+        var pending = _pendingSwitch;
+        _pendingSwitch = null;
+        var current = GetCurrentMode();
+
+        if (pending == null)
+        {
+            if (current.HasValue)
+                _confirmedMode = current;
+            return;
+        }
+
+        var modeMatches = current.HasValue
+            && current.Value.Type == pending.Mode.Type
+            && current.Value.Mode == pending.Mode.Mode;
+        var mapMatches = string.Equals(mapName, pending.MapName, StringComparison.OrdinalIgnoreCase);
+        if (!modeMatches || !mapMatches)
+        {
+            Logger.LogWarning("Mode switch did not reach target mode/map (target {Mode}/{Map}, loaded {Type}/{GameMode}/{LoadedMap})",
+                pending.Mode.Alias, pending.MapName, current?.Type, current?.Mode, mapName);
+            return;
+        }
+
+        _confirmedMode = current;
+
+        Server.ExecuteCommand("bot_quota 0");
+        Server.ExecuteCommand("bot_kick all");
+        AddTimer(0.5f, () =>
+        {
+            // Keep the game mode cfg from filling slots again after the exact plan is applied.
+            Server.ExecuteCommand("bot_quota_mode normal");
+            Server.ExecuteCommand("bot_quota 0");
+            for (var i = 0; i < pending.Plan.CounterTerroristBots; i++)
+                Server.ExecuteCommand("bot_add ct");
+            for (var i = 0; i < pending.Plan.TerroristBots; i++)
+                Server.ExecuteCommand("bot_add t");
+            for (var i = 0; i < pending.Plan.FreeForAllBots; i++)
+                Server.ExecuteCommand("bot_add");
+        });
+    }
+
+    private void ConfigureKickPunishment()
+    {
+        var kickBanDuration = ConVar.Find("sv_kick_ban_duration");
+        if (kickBanDuration == null)
+        {
+            Logger.LogWarning("ConVar sv_kick_ban_duration is unavailable; automatic kicks may still create temporary bans");
+            return;
+        }
+
+        kickBanDuration.SetValue(0);
+    }
+
+    private static BotPlan BuildBotPlan(ModeDefinition mode, bool forceBalanceTeams)
+    {
+        var humans = Utilities.GetPlayers().Where(p => p.IsValid && !p.IsBot).ToArray();
+        if (mode.IsFreeForAll)
+            return new BotPlan(0, 0, Math.Max(0, mode.TotalPlayers - humans.Length));
+
+        var ctHumans = humans.Count(p => p.TeamNum == (int)CsTeam.CounterTerrorist);
+        var tHumans = humans.Count(p => p.TeamNum == (int)CsTeam.Terrorist);
+        if (forceBalanceTeams)
+            return new BotPlan(Math.Max(0, mode.CounterTerroristTarget - ctHumans), Math.Max(0, mode.TerroristTarget - tHumans), 0);
+
+        var bots = Math.Max(0, mode.TotalPlayerTarget - ctHumans - tHumans);
+        if (ctHumans > 0 && tHumans == 0)
+            return new BotPlan(0, bots, 0);
+        if (tHumans > 0 && ctHumans == 0)
+            return new BotPlan(bots, 0, 0);
+
+        // With humans on both sides (or no humans), let the game place the bots
+        // without imposing another team distribution.
+        return new BotPlan(0, 0, bots);
     }
 
     private void OnMenuTick()
@@ -373,44 +495,134 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
     // ---- helpers ----
 
-    private string T(CCSPlayerController player, string key)
+    private string T(CCSPlayerController player, string key, params object[] args)
     {
-        var localized = Localizer.ForPlayer(player, key);
+        var localized = args.Length == 0
+            ? Localizer.ForPlayer(player, key)
+            : Localizer.ForPlayer(player, key, args);
         if (!string.Equals(localized, key, StringComparison.Ordinal))
             return localized;
 
-        return player.GetLanguage().Name.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+        var value = player.GetLanguage().Name.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
             ? FallbackZh(key)
             : FallbackEn(key);
+        return args.Length == 0 ? value : FormatFallback(value, args);
+    }
+
+    private static string FormatFallback(string value, object[] args)
+    {
+        for (var i = 0; i < args.Length; i++)
+            value = value.Replace($"{{{i}}}", Convert.ToString(args[i], System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal);
+        return value;
     }
 
     private static string FallbackZh(string key) => key switch
     {
+        "Prefix" => "{green}[游戏模式]{default}",
+        "NoPermission" => "{red}你没有使用此命令的权限。{default}",
+        "SwitchInProgress" => "{red}已在切换流程中，请稍候。{default}",
+        "Switch.Announce" => "{red}{0}{default} 将服务器模式切换为 {yellow}{1}{default}，{red}{2}{default} 秒后更换地图",
+        "Switch.Countdown" => "即将切换到 <font color='#9acd32'>{0}</font><br>{1} 秒后更换地图",
+        "Switch.Executing" => "正在切换到 {yellow}{0}{default}，地图加载中...",
         "Menu.Title" => "选择游戏模式",
+        "Menu.ModeTitle" => "选择模式",
+        "Menu.MapTitle" => "选择 {0} 的地图",
+        "ModeGroup.Classic" => "经典模式",
+        "ModeGroup.Wingman" => "搭档模式",
+        "ModeGroup.Retakes" => "回防模式",
+        "ModeGroup.WarGames" => "战争游戏模式",
+        "ModeGroup.Other" => "其他模式",
         "Menu.Current" => "（当前）",
+        "Menu.Control.Move" => "移动",
+        "Menu.Control.Select" => "确认",
+        "Menu.Control.Back" => "返回",
+        "Menu.Control.Exit" => "退出",
         "Mode.Casual" => "休闲模式",
         "Mode.Competitive" => "竞技模式",
-        "Mode.Wingman" => "搭档模式（2v2）",
+        "Mode.Wingman" => "搭档模式",
+        "Mode.Retakes" => "回防模式",
         "Mode.ArmsRace" => "军备竞赛",
         "Mode.Demolition" => "爆破模式",
         "Mode.Deathmatch" => "死亡竞赛",
-        "Mode.Training" => "训练模式",
-        "Mode.Custom" => "自定义模式",
+        "Mode.Training" => "训练",
+        "Mode.Custom" => "自定义",
+        "Map.de_cache" => "死城之谜",
+        "Map.de_dust2" => "炙热沙城 II",
+        "Map.de_mirage" => "荒漠迷城",
+        "Map.de_inferno" => "炼狱小镇",
+        "Map.de_nuke" => "核子危机",
+        "Map.de_overpass" => "死亡游乐园",
+        "Map.de_ancient" => "远古遗迹",
+        "Map.de_anubis" => "阿努比斯",
+        "Map.de_vertigo" => "殒命大厦",
+        "Map.de_lake" => "湖畔",
+        "Map.de_debris" => "残翼小镇",
+        "Map.de_eldorado" => "黄金之城",
+        "Map.de_poseidon" => "波塞冬",
+        "Map.de_boulder" => "岩岛修道院",
+        "Map.de_fachwerk" => "木筋屋小镇",
+        "Map.cs_shelter" => "动物收容所",
+        "Map.de_train" => "列车停放站",
+        "Map.de_ancient_night" => "远古遗迹",
+        "Map.ar_baggage" => "行李仓库",
+        "Map.ar_shoots" => "山林小寨",
+        "Map.ar_shoots_night" => "山林夜寨",
+        "Map.ar_pool_day" => "泳池派对",
         _ => key,
     };
 
     private static string FallbackEn(string key) => key switch
     {
+        "Prefix" => "{green}[Gamemode]{default}",
+        "NoPermission" => "{red}You do not have permission to use this command.{default}",
+        "SwitchInProgress" => "{red}A switch is already in progress, please wait.{default}",
+        "Switch.Announce" => "{red}{0}{default} is switching the server to {yellow}{1}{default}, map changes in {red}{2}{default}s",
+        "Switch.Countdown" => "Switching to <font color='#9acd32'>{0}</font><br>Changing map in {1}s",
+        "Switch.Executing" => "Switching to {yellow}{0}{default}, loading map...",
         "Menu.Title" => "Select Game Mode",
+        "Menu.ModeTitle" => "Select Mode",
+        "Menu.MapTitle" => "Select a map for {0}",
+        "ModeGroup.Classic" => "Classic Mode",
+        "ModeGroup.Wingman" => "Wingman",
+        "ModeGroup.Retakes" => "Retakes",
+        "ModeGroup.WarGames" => "War Games",
+        "ModeGroup.Other" => "Other Modes",
         "Menu.Current" => " (current)",
+        "Menu.Control.Move" => "Move",
+        "Menu.Control.Select" => "Select",
+        "Menu.Control.Back" => "Back",
+        "Menu.Control.Exit" => "Exit",
         "Mode.Casual" => "Casual",
         "Mode.Competitive" => "Competitive",
-        "Mode.Wingman" => "Wingman (2v2)",
+        "Mode.Wingman" => "Wingman",
+        "Mode.Retakes" => "Retakes",
         "Mode.ArmsRace" => "Arms Race",
         "Mode.Demolition" => "Demolition",
         "Mode.Deathmatch" => "Deathmatch",
         "Mode.Training" => "Training",
         "Mode.Custom" => "Custom",
+        "Map.de_cache" => "Cache",
+        "Map.de_dust2" => "Dust II",
+        "Map.de_mirage" => "Mirage",
+        "Map.de_inferno" => "Inferno",
+        "Map.de_nuke" => "Nuke",
+        "Map.de_overpass" => "Overpass",
+        "Map.de_ancient" => "Ancient",
+        "Map.de_anubis" => "Anubis",
+        "Map.de_vertigo" => "Vertigo",
+        "Map.de_lake" => "Lake",
+        "Map.de_debris" => "Debris",
+        "Map.de_eldorado" => "Eldorado",
+        "Map.de_poseidon" => "Poseidon",
+        "Map.de_boulder" => "Boulder",
+        "Map.de_fachwerk" => "Fachwerk",
+        "Map.cs_shelter" => "Shelter",
+        "Map.de_train" => "Train",
+        "Map.de_ancient_night" => "Ancient",
+        "Map.ar_baggage" => "Baggage",
+        "Map.ar_shoots" => "Shoots",
+        "Map.ar_shoots_night" => "Shoots Night",
+        "Map.ar_pool_day" => "Pool Day",
         _ => key,
     };
 
@@ -464,3 +676,41 @@ internal sealed class SgMenuState
     public DateTime OpenedAtUtc { get; set; }
     public DateTime LastInputUtc { get; set; }
 }
+
+internal sealed record ModeDefinition(
+    string Alias,
+    int Type,
+    int Mode,
+    string LangKey,
+    int PlayersPerTeam,
+    int TotalPlayers,
+    bool IsFreeForAll,
+    string[] Maps)
+{
+    public string GroupKey => Alias switch
+    {
+        "casual" or "competitive" => "ModeGroup.Classic",
+        "wingman" => "ModeGroup.Wingman",
+        "retakes" => "ModeGroup.Retakes",
+        "armsrace" or "demolition" or "deathmatch" => "ModeGroup.WarGames",
+        _ => "ModeGroup.Other",
+    };
+
+    public int CounterTerroristTarget => Alias == "retakes" ? 4 : PlayersPerTeam;
+    public int TerroristTarget => Alias == "retakes" ? 3 : PlayersPerTeam;
+    public int TotalPlayerTarget => IsFreeForAll ? TotalPlayers : CounterTerroristTarget + TerroristTarget;
+
+    public ModeDefinition(string alias, int type, int mode, string langKey, int playersPerTeam, string[] maps)
+        : this(alias, type, mode, langKey, playersPerTeam, 0, false, maps)
+    {
+    }
+}
+
+internal sealed record MapDefinition(string Name)
+{
+    public string LangKey => $"Map.{Name}";
+}
+
+internal sealed record BotPlan(int CounterTerroristBots, int TerroristBots, int FreeForAllBots = 0);
+
+internal sealed record PendingSwitch(ModeDefinition Mode, string MapName, BotPlan Plan);

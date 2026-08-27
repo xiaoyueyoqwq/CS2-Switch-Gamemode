@@ -12,5 +12,8 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
     /// <summary>Seconds announced before executing the switch. 0 switches immediately.</summary>
     public int CountdownSeconds { get; set; } = 5;
 
+    /// <summary>Whether the initial bot setup must match the target mode's CT/T team sizes.</summary>
+    public bool ForceBalanceTeams { get; set; } = true;
+
     public string MenuCommand { get; set; } = "css_gamemode";
 }
