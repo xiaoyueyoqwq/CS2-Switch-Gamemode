@@ -16,7 +16,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     public override string ModuleName => "[CS2-Switch-Gamemode]";
     public override string ModuleDescription => "In-game vanilla game mode switcher with localized menu";
     public override string ModuleAuthor => "xiaoyueyoqwq";
-    public override string ModuleVersion => "1.0.0";
+    public override string ModuleVersion => "1.1.0";
 
     public GameModeSwitcherConfig Config { get; set; } = new();
 
