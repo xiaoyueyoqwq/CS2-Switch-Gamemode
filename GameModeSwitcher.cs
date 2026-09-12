@@ -5,6 +5,7 @@ using CounterStrikeSharp.API.Core.Translations;
 using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
 
@@ -16,7 +17,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     public override string ModuleName => "[CS2-Switch-Gamemode]";
     public override string ModuleDescription => "In-game vanilla game mode switcher with localized menu";
     public override string ModuleAuthor => "xiaoyueyoqwq";
-    public override string ModuleVersion => "1.1.0";
+    public override string ModuleVersion => "1.1.1";
 
     public GameModeSwitcherConfig Config { get; set; } = new();
 
@@ -31,20 +32,24 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
     private static readonly ModeDefinition[] Modes =
     {
-        new("casual",      0, 0, "Mode.Casual",      5, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
-        new("competitive", 0, 1, "Mode.Competitive", 5, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
-        new("wingman",     0, 2, "Mode.Wingman",     2, new[] { "de_debris", "de_eldorado", "de_poseidon", "de_overpass", "de_vertigo", "de_nuke", "de_inferno" }),
-        new("retakes",     0, 5, "Mode.Retakes",      0, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient_night", "de_train", "de_vertigo", "de_overpass" }),
-        new("armsrace",    1, 0, "Mode.ArmsRace",    0, 10, true, new[] { "ar_shoots", "ar_shoots_night", "ar_baggage", "ar_pool_day" }),
-        new("demolition",  1, 1, "Mode.Demolition",  5, new[] { "de_safehouse" }),
-        new("deathmatch",  1, 2, "Mode.Deathmatch",  0, 10, true, new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
-        new("training",    2, 0, "Mode.Training",    5, new[] { "de_dust2" }),
-        new("custom",      3, 0, "Mode.Custom",      5, new[] { "de_dust2", "de_mirage", "de_inferno", "de_nuke", "de_overpass", "de_ancient", "de_anubis", "de_vertigo" }),
+        new("casual",      0, 0, "Mode.Casual",      new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
+        new("competitive", 0, 1, "Mode.Competitive", new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
+        new("wingman",     0, 2, "Mode.Wingman",     new[] { "de_debris", "de_eldorado", "de_poseidon", "de_overpass", "de_vertigo", "de_nuke", "de_inferno" }),
+        new("retakes",     0, 5, "Mode.Retakes",      new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient_night", "de_train", "de_vertigo", "de_overpass" }),
+        new("armsrace",    1, 0, "Mode.ArmsRace",    new[] { "ar_shoots", "ar_shoots_night", "ar_baggage", "ar_pool_day" }),
+        new("demolition",  1, 1, "Mode.Demolition",  new[] { "de_safehouse" }),
+        new("deathmatch",  1, 2, "Mode.Deathmatch",  new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
+        new("training",    2, 0, "Mode.Training",    new[] { "de_dust2" }),
+        new("custom",      3, 0, "Mode.Custom",      new[] { "de_dust2", "de_mirage", "de_inferno", "de_nuke", "de_overpass", "de_ancient", "de_anubis", "de_vertigo" }),
     };
 
     private static readonly string[] ModeGroups = { "ModeGroup.Classic", "ModeGroup.Wingman", "ModeGroup.Retakes", "ModeGroup.WarGames", "ModeGroup.Other" };
 
-    public void OnConfigParsed(GameModeSwitcherConfig config) => Config = config;
+    public void OnConfigParsed(GameModeSwitcherConfig config)
+    {
+        Config = config ?? new GameModeSwitcherConfig();
+        Config.Normalize();
+    }
 
     public override void Load(bool hotReload)
     {
@@ -55,7 +60,6 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         RegisterListener<Listeners.OnTick>(OnMenuTick);
         RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
-        ConfigureKickPunishment();
         Logger.LogInformation("Loaded (version {Version})", ModuleVersion);
     }
 
@@ -109,7 +113,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         var mapName = map.Name;
         var remaining = Math.Max(0, Config.CountdownSeconds);
 
-        var pending = new PendingSwitch(mode, map.Name, BuildBotPlan(mode, Config.ForceBalanceTeams));
+        var pending = new PendingSwitch(mode, map.Name);
         _pendingSwitch = pending;
 
         Broadcast(p => T(p, "Switch.Announce", initiatorName, T(p, mode.LangKey), remaining));
@@ -239,7 +243,6 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
     private void OnMapStart(string mapName)
     {
-        ConfigureKickPunishment();
         var pending = _pendingSwitch;
         _pendingSwitch = null;
         var current = GetCurrentMode();
@@ -263,55 +266,32 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         }
 
         _confirmedMode = current;
+        if (Config.ResetBotPopulationAfterSwitch)
+            ScheduleBotPopulationReset(pending.Mode);
+    }
 
-        Server.ExecuteCommand("bot_quota 0");
-        Server.ExecuteCommand("bot_kick all");
-        AddTimer(0.5f, () =>
+    private void ScheduleBotPopulationReset(ModeDefinition targetMode)
+    {
+        AddTimer(Config.BotPopulationResetDelaySeconds, () =>
         {
-            // Keep the game mode cfg from filling slots again after the exact plan is applied.
-            Server.ExecuteCommand("bot_quota_mode normal");
+            var current = GetCurrentMode();
+            if (!current.HasValue
+                || current.Value.Type != targetMode.Type
+                || current.Value.Mode != targetMode.Mode)
+            {
+                Logger.LogWarning("Skipping post-switch BOT reset because the target mode is no longer active");
+                return;
+            }
+
+            // game_alias executes Valve's target cfg before changelevel. Reassert
+            // the manual policy after that cfg and remove any inherited bots.
+            Server.ExecuteCommand("mp_autoteambalance 0");
+            Server.ExecuteCommand("mp_limitteams 0");
+            Server.ExecuteCommand("bot_quota_mode fill");
             Server.ExecuteCommand("bot_quota 0");
-            for (var i = 0; i < pending.Plan.CounterTerroristBots; i++)
-                Server.ExecuteCommand("bot_add ct");
-            for (var i = 0; i < pending.Plan.TerroristBots; i++)
-                Server.ExecuteCommand("bot_add t");
-            for (var i = 0; i < pending.Plan.FreeForAllBots; i++)
-                Server.ExecuteCommand("bot_add");
-        });
-    }
-
-    private void ConfigureKickPunishment()
-    {
-        var kickBanDuration = ConVar.Find("sv_kick_ban_duration");
-        if (kickBanDuration == null)
-        {
-            Logger.LogWarning("ConVar sv_kick_ban_duration is unavailable; automatic kicks may still create temporary bans");
-            return;
-        }
-
-        kickBanDuration.SetValue(0);
-    }
-
-    private static BotPlan BuildBotPlan(ModeDefinition mode, bool forceBalanceTeams)
-    {
-        var humans = Utilities.GetPlayers().Where(p => p.IsValid && !p.IsBot).ToArray();
-        if (mode.IsFreeForAll)
-            return new BotPlan(0, 0, Math.Max(0, mode.TotalPlayers - humans.Length));
-
-        var ctHumans = humans.Count(p => p.TeamNum == (int)CsTeam.CounterTerrorist);
-        var tHumans = humans.Count(p => p.TeamNum == (int)CsTeam.Terrorist);
-        if (forceBalanceTeams)
-            return new BotPlan(Math.Max(0, mode.CounterTerroristTarget - ctHumans), Math.Max(0, mode.TerroristTarget - tHumans), 0);
-
-        var bots = Math.Max(0, mode.TotalPlayerTarget - ctHumans - tHumans);
-        if (ctHumans > 0 && tHumans == 0)
-            return new BotPlan(0, bots, 0);
-        if (tHumans > 0 && ctHumans == 0)
-            return new BotPlan(bots, 0, 0);
-
-        // With humans on both sides (or no humans), let the game place the bots
-        // without imposing another team distribution.
-        return new BotPlan(0, 0, bots);
+            Server.ExecuteCommand("bot_kick all");
+            Logger.LogInformation("Post-switch BOT population reset completed for {Mode}", targetMode.Alias);
+        }, TimerFlags.STOP_ON_MAPCHANGE);
     }
 
     private void OnMenuTick()
@@ -682,9 +662,6 @@ internal sealed record ModeDefinition(
     int Type,
     int Mode,
     string LangKey,
-    int PlayersPerTeam,
-    int TotalPlayers,
-    bool IsFreeForAll,
     string[] Maps)
 {
     public string GroupKey => Alias switch
@@ -696,14 +673,6 @@ internal sealed record ModeDefinition(
         _ => "ModeGroup.Other",
     };
 
-    public int CounterTerroristTarget => Alias == "retakes" ? 4 : PlayersPerTeam;
-    public int TerroristTarget => Alias == "retakes" ? 3 : PlayersPerTeam;
-    public int TotalPlayerTarget => IsFreeForAll ? TotalPlayers : CounterTerroristTarget + TerroristTarget;
-
-    public ModeDefinition(string alias, int type, int mode, string langKey, int playersPerTeam, string[] maps)
-        : this(alias, type, mode, langKey, playersPerTeam, 0, false, maps)
-    {
-    }
 }
 
 internal sealed record MapDefinition(string Name)
@@ -711,6 +680,4 @@ internal sealed record MapDefinition(string Name)
     public string LangKey => $"Map.{Name}";
 }
 
-internal sealed record BotPlan(int CounterTerroristBots, int TerroristBots, int FreeForAllBots = 0);
-
-internal sealed record PendingSwitch(ModeDefinition Mode, string MapName, BotPlan Plan);
+internal sealed record PendingSwitch(ModeDefinition Mode, string MapName);

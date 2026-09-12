@@ -13,10 +13,8 @@ Switch between every vanilla game mode from a chat command — no console, no se
 - `!gamemode` opens an in-game CenterHTML menu (AdminPlus-style interaction: **W/S** move, **E** select, **A** back, **R** exit, player frozen while browsing)
 - Mode categories match Valve's terminology: **Classic Modes** contains Casual and Competitive; **Wingman** is the separate 2v2 mode; **Retakes** is a separate 7-player mode; **War Games** contains Arms Race, Demolition and Deathmatch
 - Selecting a mode opens a second menu containing only maps supported by that mode
-- Before the map change, the plugin records real players on each team. After the new map loads it removes inherited bots and adds exactly the number required by the target mode (FFA modes use their total-player target)
-- `ForceBalanceTeams` controls only the one-time setup after a map change; disabling it still clears inherited bots, then allows an asymmetric initial setup without later corrections
+- The plugin only changes `game_alias` and `changelevel`; Valve and the server's mode cfg files remain responsible for BOT population and team balance
 - Server-wide broadcast + configurable countdown before executing the switch
-- Excessive team damage still follows `mp_autokick` / `mp_td_dmgtokick`, but `sv_kick_ban_duration` is set to `0` so the punishment is a kick without a temporary server ban
 - Localized **简体中文 / en-US** through the CounterStrikeSharp language system, with built-in fallbacks
 - Permission gated by a configurable admin flag (`@css/changemap` by default)
 
@@ -39,7 +37,7 @@ Switch between every vanilla game mode from a chat command — no console, no se
 | `css_gamemode` | console / rcon | Same, plus a plain mode list when run from the server console |
 
 After picking a mode and map the server announces the switch, counts down (5s by default), then executes
-`game_alias <mode>` followed by `changelevel <selected map>`. Players stay connected through the map change, and the target mode's bot plan is applied when the map starts.
+`game_alias <mode>` followed by `changelevel <selected map>`. Players stay connected through the map change; the target mode's own server cfg files retain full control of BOT and team state.
 
 ## Configuration
 
@@ -50,7 +48,6 @@ After picking a mode and map the server announces the switch, counts down (5s by
   "Version": 1,
   "RequiredFlag": "@css/changemap", // admin flag required to open the menu
   "CountdownSeconds": 5,             // 0 = switch immediately
-  "ForceBalanceTeams": true,         // false = allow one-sided/custom bot setups
   "MenuCommand": "css_gamemode"      // primary console command
 }
 ```
@@ -60,7 +57,7 @@ After picking a mode and map the server announces the switch, counts down (5s by
 Based on Valve's current `gamemodes.txt`; maps absent from the target server are
 omitted from this build:
 
-| Alias | game_type | game_mode | Target players | Supported maps |
+| Alias | game_type | game_mode | Official player metadata | Supported maps |
 |---|---:|---:|---|---|
 | `casual` | 0 | 0 | 5 per team | Official casual map group |
 | `competitive` | 0 | 1 | 5 per team | Official competitive map group |
@@ -74,6 +71,49 @@ omitted from this build:
 
 > Note: the top-level **Classic Modes** label is a category, not an extra `game_alias`. Create `gamemode_<mode>_server.cfg`
 > if you want custom settings (bot policy, etc.) applied in non-competitive modes too.
+
+## BotHider compatibility with voting and bot population plugins
+
+BotHider's `identity_mode` changes how the engine identifies managed bots.
+
+With the default `player` mode, BotHider clears part of Valve's native
+fake-client state, so bots appear more like real players at the engine level.
+This affects native vote counts, `bot_quota` and bot population maintenance,
+`bot_kick`/`bot_add`, player-count checks during map changes, and any other
+plugin that relies on `IsBot` or the native fake-client state. This is an engine
+identity change, not only a scoreboard display change; Valve and other plugins
+may classify the bot as a human before BotHider can adjust it.
+
+The project previously attempted to compensate for `player` mode by listening
+to native vote events and temporarily restoring bot identity. That approach was
+removed because vote-event ordering, native vtable locations, map transitions,
+entity destruction, and overlapping population management can vary by CS2
+version and plugin. Keeping those global hooks would risk vote failures, broken
+map transitions, or server crashes.
+
+### Recommended BotHider configuration
+
+When using CS2-Vote-Improver or another plugin that reads player counts or
+manages bots, keep Valve's native bot identity:
+
+```json
+{
+  "identity_mode": "bot"
+}
+```
+
+The actual configuration value is `"bot"`. Keeping the native bot
+identity avoids the engine-level problems caused by `identity_mode: "player"`.
+
+Plugins that handle votes, player counts, `bot_quota`, map changes, or bot
+creation/removal should use Valve's native bot flag as the identity source.
+CS2-Switch-Gamemode does not read or modify bot population and does not run a
+team-balance loop; it only requests the mode and map change.
+Scoreboard appearance is not proof that a client is a human, and multiple
+plugins should not run independent `bot_quota`, `bot_kick`, or `bot_add` loops
+over the same map-change lifecycle. `identity_mode: "player"` remains suitable
+for display-only use cases, but should not be combined with plugins that depend
+on native player identity or bot population state.
 
 ## Building
 
@@ -102,8 +142,7 @@ Deploy only these files into the plugin folder: `CS2-Switch-Gamemode.dll`, `.dep
 - 菜单交互复刻 AdminPlus 设计：W/S 移动、E 确认、A 返回、R 退出，浏览时冻结玩家
 - 顶层按官方术语分组：经典模式包含休闲和竞技；搭档模式是独立的 2v2 模式；战争游戏包含军备竞赛、爆破和死亡竞赛
 - 选择模式后进入地图二级菜单，仅显示该模式支持的地图
-- 换图时按目标模式的人数规则重新计算 BOT：按 CT/T 真人数量补足两边人数，FFA 模式按总人数补足
-- `ForceBalanceTeams` 只控制换图后的首次人数设置；关闭时仍会清理上一局 BOT，但允许非对称初始阵容，之后不再纠正人数
+- 插件只执行 `game_alias` 和 `changelevel`，BOT 人口、队伍平衡和其他服务器 CVar 完全交由 Valve 及服务器模式配置处理
 - 地图名称支持简体中文和英文，其他语言回退英文
 - 当前模式会标记为“当前”，但仍可进入其地图菜单
 - 切换前全服广播并倒计时（默认 5 秒，可在配置中改为立即执行）
@@ -123,3 +162,45 @@ dotnet build -c Release
 ```
 
 部署时只需 `CS2-Switch-Gamemode.dll`、`.deps.json`、`.pdb` 与 `lang/` 目录。
+
+### BotHider 与投票、人口管理插件的兼容性说明
+
+BotHider 的 `identity_mode` 会影响引擎识别托管 BOT 的方式。
+
+在默认的 `player` 模式下，BotHider 会清除部分 Valve 原生的 fake-client
+标志，使 BOT 在引擎层看起来更像真实玩家。这会影响原生投票的有效投票人数
+计算、`bot_quota` 和 BOT 人口维护、`bot_kick`/`bot_add` 命令结果、换图时的
+玩家数量检测，以及其他依赖 `IsBot` 或原生 fake-client 状态的插件。这不是
+单纯的记分板显示变化：在 BotHider 有机会修正之前，Valve 和其他插件可能已经
+把这些 BOT 当作真人处理。
+
+项目曾尝试通过监听原生投票事件、临时恢复 BOT 身份来兼容 `player` 模式。由于
+投票事件顺序与实际投票状态建立过程存在时序差异，native vtable 和函数调用位置
+依赖具体 CS2 版本，换图、卸载和实体销毁期间还可能发生竞态，并且可能覆盖其他
+插件的人口管理逻辑，无法同时保证投票、换图和 BOT 人口操作的完整生命周期。这类
+全局兼容钩子已经移除，避免为修复投票问题引入更严重的投票、换图或服务器崩溃风险。
+
+#### 推荐配置
+
+与 CS2-Vote-Improver 或其他读取玩家数量、管理 BOT 人口的插件一起使用时，请保留
+Valve 的原生 BOT 身份：
+
+```json
+{
+  "identity_mode": "bot"
+}
+```
+
+配置文件中的实际值是 `"bot"`。保留原生 BOT 身份可以避免
+`identity_mode: "player"` 带来的引擎身份问题。
+
+#### 维护插件时的原则
+
+涉及投票、玩家数量、`bot_quota`、换图或 BOT 增删的插件，应优先使用 Valve 的原生
+BOT 标志作为身份来源。不要假设记分板上看起来像真人的客户端一定是真人，也不要在
+换图生命周期中同时执行多套 `bot_quota`、`bot_kick` 和 `bot_add` 逻辑。
+
+CS2-Switch-Gamemode 不读取或修改 BOT 人口，不执行队伍平衡循环，只请求模式和地图切换。
+
+`identity_mode: "player"` 仍可用于只关注外观显示的场景，但不应与依赖原生玩家身份
+或 BOT 人口状态的插件组合使用。

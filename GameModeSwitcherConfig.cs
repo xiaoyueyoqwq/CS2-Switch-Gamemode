@@ -12,8 +12,17 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
     /// <summary>Seconds announced before executing the switch. 0 switches immediately.</summary>
     public int CountdownSeconds { get; set; } = 5;
 
-    /// <summary>Whether the initial bot setup must match the target mode's CT/T team sizes.</summary>
-    public bool ForceBalanceTeams { get; set; } = true;
+    /// <summary>Restore the manual BOT population policy after a mode switch.</summary>
+    public bool ResetBotPopulationAfterSwitch { get; set; } = true;
+
+    /// <summary>Delay after map start so the target mode cfg has finished executing.</summary>
+    public float BotPopulationResetDelaySeconds { get; set; } = 0.75f;
 
     public string MenuCommand { get; set; } = "css_gamemode";
+
+    public void Normalize()
+    {
+        CountdownSeconds = Math.Clamp(CountdownSeconds, 0, 60);
+        BotPopulationResetDelaySeconds = Math.Clamp(BotPopulationResetDelaySeconds, 0.1f, 10f);
+    }
 }
