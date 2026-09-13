@@ -15,13 +15,14 @@ namespace SwitchGamemode;
 public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitcherConfig>
 {
     public override string ModuleName => "[CS2-Switch-Gamemode]";
-    public override string ModuleDescription => "In-game vanilla game mode switcher with localized menu";
+    public override string ModuleDescription => "In-game game mode switcher driven by JSON presets";
     public override string ModuleAuthor => "xiaoyueyoqwq";
-    public override string ModuleVersion => "1.1.1";
+    public override string ModuleVersion => "1.3.4";
 
     public GameModeSwitcherConfig Config { get; set; } = new();
 
     private const int MenuOpenGraceMs = 400;
+    private const int MaxModeApplyRetries = 1;
     private static readonly TimeSpan MenuInputDebounce = TimeSpan.FromMilliseconds(120);
 
     private readonly Dictionary<int, SgMenuState> _menuStates = new();
@@ -29,26 +30,19 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     private PendingSwitch? _pendingSwitch;
     private (int Type, int Mode)? _confirmedMode;
     private bool _switchInProgress;
-
-    private static readonly ModeDefinition[] Modes =
-    {
-        new("casual",      0, 0, "Mode.Casual",      new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
-        new("competitive", 0, 1, "Mode.Competitive", new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
-        new("wingman",     0, 2, "Mode.Wingman",     new[] { "de_debris", "de_eldorado", "de_poseidon", "de_overpass", "de_vertigo", "de_nuke", "de_inferno" }),
-        new("retakes",     0, 5, "Mode.Retakes",      new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient_night", "de_train", "de_vertigo", "de_overpass" }),
-        new("armsrace",    1, 0, "Mode.ArmsRace",    new[] { "ar_shoots", "ar_shoots_night", "ar_baggage", "ar_pool_day" }),
-        new("demolition",  1, 1, "Mode.Demolition",  new[] { "de_safehouse" }),
-        new("deathmatch",  1, 2, "Mode.Deathmatch",  new[] { "de_cache", "de_anubis", "de_inferno", "de_mirage", "de_dust2", "de_nuke", "de_ancient", "de_train", "de_vertigo", "de_overpass", "de_boulder", "de_fachwerk", "cs_shelter", "cs_office", "cs_italy" }),
-        new("training",    2, 0, "Mode.Training",    new[] { "de_dust2" }),
-        new("custom",      3, 0, "Mode.Custom",      new[] { "de_dust2", "de_mirage", "de_inferno", "de_nuke", "de_overpass", "de_ancient", "de_anubis", "de_vertigo" }),
-    };
-
-    private static readonly string[] ModeGroups = { "ModeGroup.Classic", "ModeGroup.Wingman", "ModeGroup.Retakes", "ModeGroup.WarGames", "ModeGroup.Other" };
+    private bool _worldApplyArmed;
+    private int _switchGeneration;
+    private int _modeApplyRetries;
+    private string? _countdownLabel;
+    private int _countdownRemaining;
 
     public void OnConfigParsed(GameModeSwitcherConfig config)
     {
         Config = config ?? new GameModeSwitcherConfig();
-        Config.Normalize();
+        var dropped = Config.Normalize();
+        if (dropped > 0)
+            Logger.LogWarning("Dropped {Dropped} presets with empty Label or Map", dropped);
+        Logger.LogInformation("Loaded {Count} presets", Config.Presets.Length);
     }
 
     public override void Load(bool hotReload)
@@ -60,7 +54,19 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         RegisterListener<Listeners.OnTick>(OnMenuTick);
         RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
-        Logger.LogInformation("Loaded (version {Version})", ModuleVersion);
+        Logger.LogInformation("Loaded (version {Version}, {Count} presets)", ModuleVersion, Config.Presets.Length);
+    }
+
+    public override void Unload(bool hotReload)
+    {
+        ClearCountdown();
+        DisarmWorldApply();
+        RemoveListener<Listeners.OnTick>(OnMenuTick);
+        RemoveListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
+        RemoveListener<Listeners.OnMapStart>(OnMapStart);
+        RemoveCommand(Config.MenuCommand, OnGamemodeCommand);
+        if (!string.Equals(Config.MenuCommand, "gamemode", StringComparison.OrdinalIgnoreCase))
+            RemoveCommand("gamemode", OnGamemodeCommand);
     }
 
     // ---- command ----
@@ -69,8 +75,24 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     {
         if (player == null)
         {
-            foreach (var mode in Modes)
-                command.ReplyToCommand($"{mode.Alias} = game_type {mode.Type} + game_mode {mode.Mode}");
+            var label = command.ArgString.Trim();
+            if (label.Length > 0)
+            {
+                TryBeginSwitchFromConsole(command, label);
+                return;
+            }
+
+            if (Config.Presets.Length == 0)
+            {
+                command.ReplyToCommand("No presets configured");
+                return;
+            }
+
+            foreach (var preset in Config.Presets)
+            {
+                command.ReplyToCommand(
+                    $"{preset.Group} / {preset.Label} = game_type {preset.GameType} game_mode {preset.GameMode} alias {preset.GameAlias} map {preset.Map} via {BuildMapCommand(preset.Map)}");
+            }
             return;
         }
 
@@ -92,6 +114,35 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         OpenMenu(player, resetHistory: true);
     }
 
+    private void TryBeginSwitchFromConsole(CommandInfo command, string label)
+    {
+        if (_switchInProgress)
+        {
+            command.ReplyToCommand("Switch already in progress");
+            return;
+        }
+
+        GameModePreset? match = null;
+        foreach (var preset in Config.Presets)
+        {
+            if (preset.Label == label)
+            {
+                match = preset;
+                break;
+            }
+        }
+
+        if (match == null)
+        {
+            command.ReplyToCommand($"No preset labelled {label}");
+            return;
+        }
+
+        command.ReplyToCommand(
+            $"Switching to {match.Group} / {match.Label} via {BuildMapCommand(match.Map)}");
+        BeginSwitch(null, match);
+    }
+
     // ---- modes ----
 
     private static (int Type, int Mode)? GetCurrentMode()
@@ -104,48 +155,95 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         return (type.GetPrimitiveValue<int>(), mode.GetPrimitiveValue<int>());
     }
 
-    private void BeginSwitch(CCSPlayerController initiator, ModeDefinition mode, MapDefinition map)
+    private bool IsCurrentPreset(GameModePreset preset)
     {
-        CloseMenu(initiator);
+        var current = _confirmedMode ?? GetCurrentMode();
+        if (!current.HasValue)
+            return false;
+        if (current.Value.Type != preset.GameType || current.Value.Mode != preset.GameMode)
+            return false;
+
+        return MapReached(Server.MapName, preset.Map);
+    }
+
+    private void BeginSwitch(CCSPlayerController? initiator, GameModePreset preset)
+    {
+        if (initiator != null && initiator.IsValid)
+            CloseMenu(initiator);
 
         _switchInProgress = true;
-        var initiatorName = initiator.PlayerName;
-        var mapName = map.Name;
+        _switchGeneration++;
+        _modeApplyRetries = 0;
+        var initiatorName = initiator != null && initiator.IsValid ? initiator.PlayerName : "console";
+        var label = preset.Label;
         var remaining = Math.Max(0, Config.CountdownSeconds);
-
-        var pending = new PendingSwitch(mode, map.Name);
+        var pending = Snapshot(preset);
         _pendingSwitch = pending;
 
-        Broadcast(p => T(p, "Switch.Announce", initiatorName, T(p, mode.LangKey), remaining));
+        Broadcast(p => T(p, "Switch.Announce", initiatorName, label, remaining));
 
-        void Execute()
+        void IssueChangeLevel()
         {
-            Broadcast(_ => T(_, "Switch.Executing", T(_, mode.LangKey)));
+            var mapCommand = BuildMapCommand(pending.Map);
+            Logger.LogInformation(
+                "Executing switch to {Label} (game_type {Type} game_mode {GameMode} alias {Alias}) map {Map} via {MapCommand}",
+                pending.Label, pending.GameType, pending.GameMode, pending.GameAlias, pending.Map, mapCommand);
+            Server.ExecuteCommand($"game_type {pending.GameType}");
+            Server.ExecuteCommand($"game_mode {pending.GameMode}");
+            Server.ExecuteCommand(mapCommand);
             _switchInProgress = false;
-            Server.ExecuteCommand($"game_alias {mode.Alias}");
-            Server.ExecuteCommand($"changelevel {mapName}");
+        }
+
+        void PrepareMode()
+        {
+            ClearCountdown();
+            Broadcast(_ => T(_, "Switch.Executing", label));
+            Server.ExecuteCommand($"game_type {pending.GameType}");
+            Server.ExecuteCommand($"game_mode {pending.GameMode}");
+            if (pending.GameAlias.Length > 0)
+                Server.ExecuteCommand($"game_alias {pending.GameAlias}");
+            AddTimer(0.2f, IssueChangeLevel);
         }
 
         if (remaining == 0)
         {
-            Execute();
+            PrepareMode();
             return;
         }
 
+        // PrintToCenterHtml lasts one frame. Painting once per second only wins
+        // the slot when warmup (or another HUD) is also refreshing it.
+        var generation = _switchGeneration;
+        _countdownLabel = label;
+        _countdownRemaining = remaining;
+
         void Tick()
         {
-            if (remaining <= 0)
+            if (generation != _switchGeneration)
+                return;
+            if (_countdownRemaining <= 1)
             {
-                Execute();
+                PrepareMode();
                 return;
             }
 
-            BroadcastCenter(p => T(p, "Switch.Countdown", T(p, mode.LangKey), remaining));
-            remaining--;
+            _countdownRemaining--;
             AddTimer(1f, Tick);
         }
 
         AddTimer(1f, Tick);
+    }
+
+    private static PendingSwitch Snapshot(GameModePreset preset)
+    {
+        return new PendingSwitch(
+            preset.Label,
+            preset.GameType,
+            preset.GameMode,
+            preset.GameAlias,
+            preset.Map,
+            preset.ResetBots,
+            [.. preset.After]);
     }
 
     // ---- menu ----
@@ -156,19 +254,25 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             return;
 
         var menu = new SgMenu(T(player, "Menu.Title"));
-        foreach (var groupKey in ModeGroups)
+        var presets = Config.Presets;
+        if (presets.Length == 0)
         {
-            var groupModes = Modes.Where(m => m.GroupKey == groupKey).ToArray();
-            if (groupModes.Length == 0)
-                continue;
-            var captured = groupModes;
-            menu.Options.Add(new SgMenuOption(T(player, groupKey), p =>
-            {
-                if (captured.Length == 1)
-                    OpenMapMenu(p, captured[0]);
-                else
-                    OpenModeMenu(p, captured);
-            }));
+            menu.Options.Add(new SgMenuOption(T(player, "Menu.NoPresets"), _ => { }, disabled: true));
+            OpenMenu(player, menu, resetHistory);
+            return;
+        }
+
+        var groups = new List<string>();
+        foreach (var preset in presets)
+        {
+            if (!groups.Exists(existing => string.Equals(existing, preset.Group, StringComparison.Ordinal)))
+                groups.Add(preset.Group);
+        }
+
+        foreach (var group in groups)
+        {
+            var captured = group;
+            menu.Options.Add(new SgMenuOption(captured, p => OpenGroupMenu(p, captured)));
         }
 
         OpenMenu(player, menu, resetHistory);
@@ -194,33 +298,27 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         RenderMenu(player, state);
     }
 
-    private void OpenModeMenu(CCSPlayerController player, IReadOnlyList<ModeDefinition> modes)
+    private void OpenGroupMenu(CCSPlayerController player, string group)
     {
-        var menu = new SgMenu(T(player, "Menu.ModeTitle"));
-        foreach (var mode in modes)
+        var menu = new SgMenu(group);
+        var currentSuffix = T(player, "Menu.Current");
+        foreach (var preset in Config.Presets)
         {
-            var isCurrent = _confirmedMode.HasValue
-                && _confirmedMode.Value.Type == mode.Type
-                && _confirmedMode.Value.Mode == mode.Mode;
-            var target = mode;
-            menu.Options.Add(new SgMenuOption(T(player, mode.LangKey) + (isCurrent ? T(player, "Menu.Current") : string.Empty), p => OpenMapMenu(p, target)));
-        }
-        OpenMenu(player, menu);
-    }
+            if (!string.Equals(preset.Group, group, StringComparison.Ordinal))
+                continue;
 
-    private void OpenMapMenu(CCSPlayerController player, ModeDefinition mode)
-    {
-        var menu = new SgMenu(T(player, "Menu.MapTitle", T(player, mode.LangKey)));
-        foreach (var mapName in mode.Maps)
-        {
-            var map = new MapDefinition(mapName);
-            var target = mode;
-            menu.Options.Add(new SgMenuOption(T(player, map.LangKey), p =>
+            var target = preset;
+            var text = IsCurrentPreset(target) ? target.Label + currentSuffix : target.Label;
+            menu.Options.Add(new SgMenuOption(text, p =>
             {
                 if (!_switchInProgress)
-                    BeginSwitch(p, target, map);
+                    BeginSwitch(p, target);
             }));
         }
+
+        if (menu.Options.Count == 0)
+            menu.Options.Add(new SgMenuOption(T(player, "Menu.NoPresets"), _ => { }, disabled: true));
+
         OpenMenu(player, menu);
     }
 
@@ -243,54 +341,289 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
     private void OnMapStart(string mapName)
     {
-        var pending = _pendingSwitch;
-        _pendingSwitch = null;
-        var current = GetCurrentMode();
+        ClearCountdown();
 
+        var pending = _pendingSwitch;
         if (pending == null)
         {
+            var current = GetCurrentMode();
             if (current.HasValue)
                 _confirmedMode = current;
             return;
         }
 
-        var modeMatches = current.HasValue
-            && current.Value.Type == pending.Mode.Type
-            && current.Value.Mode == pending.Mode.Mode;
-        var mapMatches = string.Equals(mapName, pending.MapName, StringComparison.OrdinalIgnoreCase);
-        if (!modeMatches || !mapMatches)
+        // CSS OnMapStart fires at changelevel start (~68ms) with the target
+        // name, not after the world is ready. Starting the retry timer here
+        // overlaps the previous unload and clients get CREATE_SERVER_FAILED (58).
+        Logger.LogInformation(
+            "Map start during pending switch (target {Label}, map {Map}); waiting for simulating world",
+            pending.Label, mapName);
+        ArmWorldApply();
+    }
+
+    private void ArmWorldApply()
+    {
+        if (_worldApplyArmed)
+            return;
+
+        _worldApplyArmed = true;
+        RegisterListener<Listeners.OnServerPreWorldUpdate>(OnWorldApply);
+        Logger.LogInformation(
+            "Waiting for OnServerPreWorldUpdate; pending='{Label}' server='{Map}'",
+            _pendingSwitch?.Label ?? "",
+            Server.MapName ?? "");
+    }
+
+    private void OnWorldApply(bool simulating)
+    {
+        if (!simulating)
+            return;
+
+        var pending = _pendingSwitch;
+        if (pending == null)
         {
-            Logger.LogWarning("Mode switch did not reach target mode/map (target {Mode}/{Map}, loaded {Type}/{GameMode}/{LoadedMap})",
-                pending.Mode.Alias, pending.MapName, current?.Type, current?.Mode, mapName);
+            DisarmWorldApply();
             return;
         }
 
-        _confirmedMode = current;
-        if (Config.ResetBotPopulationAfterSwitch)
-            ScheduleBotPopulationReset(pending.Mode);
+        var loadedMap = Server.MapName ?? "";
+        if (!MapReached(loadedMap, pending.Map))
+            return;
+
+        DisarmWorldApply();
+
+        var current = GetCurrentMode();
+        var modeMatches = current.HasValue
+            && current.Value.Type == pending.GameType
+            && current.Value.Mode == pending.GameMode;
+        if (modeMatches)
+        {
+            _pendingSwitch = null;
+            _modeApplyRetries = 0;
+            _confirmedMode = current;
+            SchedulePostSwitch(pending);
+            return;
+        }
+
+        // host_workshop_map can leave customgamemode (type 3 / mode 0) stuck after
+        // changelevel to an official map. Map is right, Valve mode is not.
+        if (_modeApplyRetries < MaxModeApplyRetries)
+        {
+            _modeApplyRetries++;
+            var generation = _switchGeneration;
+            Logger.LogWarning(
+                "Map reached but mode did not follow (target {Label}/{Type}/{GameMode}, loaded {LoadedType}/{LoadedMode}/{LoadedMap}); retry {Retry}/{Max}",
+                pending.Label, pending.GameType, pending.GameMode,
+                current?.Type, current?.Mode, loadedMap,
+                _modeApplyRetries, MaxModeApplyRetries);
+            AddTimer(Config.BotPopulationResetDelaySeconds, () => RetryApplyTargetMode(pending, generation));
+            return;
+        }
+
+        _pendingSwitch = null;
+        _modeApplyRetries = 0;
+        Logger.LogWarning(
+            "Mode switch did not reach target mode/map (target {Label}/{Type}/{GameMode}/{Map}, loaded {LoadedType}/{LoadedMode}/{LoadedMap})",
+            pending.Label, pending.GameType, pending.GameMode, pending.Map,
+            current?.Type, current?.Mode, loadedMap);
     }
 
-    private void ScheduleBotPopulationReset(ModeDefinition targetMode)
+    private void DisarmWorldApply()
     {
+        if (!_worldApplyArmed)
+            return;
+
+        _worldApplyArmed = false;
+        RemoveListener<Listeners.OnServerPreWorldUpdate>(OnWorldApply);
+    }
+
+    private void RetryApplyTargetMode(PendingSwitch pending, int generation)
+    {
+        if (generation != _switchGeneration || _pendingSwitch != pending)
+            return;
+
+        Logger.LogInformation(
+            "Retrying mode apply for {Label}: game_type {Type} game_mode {GameMode} alias {Alias}",
+            pending.Label, pending.GameType, pending.GameMode, pending.GameAlias);
+        Server.ExecuteCommand($"game_type {pending.GameType}");
+        Server.ExecuteCommand($"game_mode {pending.GameMode}");
+        if (pending.GameAlias.Length > 0)
+            Server.ExecuteCommand($"game_alias {pending.GameAlias}");
+
+        AddTimer(0.2f, () =>
+        {
+            if (generation != _switchGeneration || _pendingSwitch != pending)
+                return;
+
+            Server.ExecuteCommand($"game_type {pending.GameType}");
+            Server.ExecuteCommand($"game_mode {pending.GameMode}");
+
+            // game_alias can make type/mode read 0/1 without exec'ing the Valve cfg.
+            // A second changelevel loads the cfg but disconnects with CREATE_SERVER_FAILED (58).
+            var current = GetCurrentMode();
+            var execs = BuildModeExecCommands(pending.GameAlias);
+            if (execs.Count == 0)
+            {
+                Logger.LogWarning(
+                    "Retry has no Valve cfg for alias {Alias}; leaving loaded rules as-is for {Label} (cvars {LoadedType}/{LoadedMode})",
+                    pending.GameAlias, pending.Label, current?.Type, current?.Mode);
+            }
+            else
+            {
+                foreach (var command in execs)
+                {
+                    Logger.LogInformation(
+                        "Retry exec {Command} for {Label} (cvars {LoadedType}/{LoadedMode})",
+                        command, pending.Label, current?.Type, current?.Mode);
+                    Server.ExecuteCommand(command);
+                }
+            }
+
+            _pendingSwitch = null;
+            _modeApplyRetries = 0;
+            if (current.HasValue)
+                _confirmedMode = current;
+            SchedulePostSwitch(pending);
+        });
+    }
+
+    internal static List<string> BuildModeExecCommands(string alias)
+    {
+        var commands = new List<string>();
+        var stem = ValveModeCfgStem(alias);
+        if (stem == null)
+            return commands;
+
+        if (ValveModeHasBaseCfg(stem))
+            commands.Add($"exec {stem}.cfg");
+        commands.Add($"exec {stem}_server.cfg");
+        return commands;
+    }
+
+    private static string? ValveModeCfgStem(string alias)
+    {
+        if (string.IsNullOrWhiteSpace(alias))
+            return null;
+
+        return alias.Trim().ToLowerInvariant() switch
+        {
+            "casual" => "gamemode_casual",
+            "competitive" => "gamemode_competitive",
+            "wingman" or "scrimcomp2v2" => "gamemode_competitive2v2",
+            "retakes" => "gamemode_retakecasual",
+            "armsrace" or "gungameprogressive" => "gamemode_armsrace",
+            "demolition" or "gungametrbomb" => "gamemode_demolition",
+            "deathmatch" => "gamemode_deathmatch",
+            "training" => "gamemode_training",
+            "custom" => "gamemode_custom",
+            var other => $"gamemode_{other}",
+        };
+    }
+
+    private static bool ValveModeHasBaseCfg(string stem)
+    {
+        return !string.Equals(stem, "gamemode_training", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool TryParseWorkshopFileId(string? map, out string fileId)
+    {
+        fileId = string.Empty;
+        if (string.IsNullOrWhiteSpace(map))
+            return false;
+
+        var normalized = map.Trim().Replace('\\', '/').Trim('/');
+        const string prefix = "workshop/";
+        if (!normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var rest = normalized[prefix.Length..];
+        if (rest.Length == 0)
+            return false;
+
+        var slash = rest.IndexOf('/');
+        var idPart = slash < 0 ? rest : rest[..slash];
+        if (idPart.Length == 0)
+            return false;
+
+        foreach (var c in idPart)
+        {
+            if (c is < '0' or > '9')
+                return false;
+        }
+
+        fileId = idPart;
+        return true;
+    }
+
+    public static string BuildMapCommand(string map)
+    {
+        return TryParseWorkshopFileId(map, out var fileId)
+            ? $"host_workshop_map {fileId}"
+            : $"changelevel {map}";
+    }
+
+    private static bool MapReached(string loadedMap, string pendingMap)
+    {
+        var loaded = NormalizeMapKey(loadedMap);
+        var pending = NormalizeMapKey(pendingMap);
+        if (loaded.Length == 0 || pending.Length == 0)
+            return false;
+
+        if (string.Equals(loaded, pending, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return string.Equals(GetMapBasename(loaded), GetMapBasename(pending), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetMapBasename(string normalizedMap)
+    {
+        var slash = normalizedMap.LastIndexOf('/');
+        return slash >= 0 && slash < normalizedMap.Length - 1
+            ? normalizedMap[(slash + 1)..]
+            : normalizedMap;
+    }
+
+    private static string NormalizeMapKey(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        return value.Trim().Replace('\\', '/').Trim('/');
+    }
+
+    private void SchedulePostSwitch(PendingSwitch pending)
+    {
+        var resetBots = Config.ResetBotPopulationAfterSwitch && pending.ResetBots;
+        if (!resetBots && pending.After.Length == 0)
+            return;
+
         AddTimer(Config.BotPopulationResetDelaySeconds, () =>
         {
             var current = GetCurrentMode();
             if (!current.HasValue
-                || current.Value.Type != targetMode.Type
-                || current.Value.Mode != targetMode.Mode)
+                || current.Value.Type != pending.GameType
+                || current.Value.Mode != pending.GameMode)
             {
-                Logger.LogWarning("Skipping post-switch BOT reset because the target mode is no longer active");
+                Logger.LogWarning("Skipping post-switch commands because the target mode is no longer active");
                 return;
             }
 
-            // game_alias executes Valve's target cfg before changelevel. Reassert
-            // the manual policy after that cfg and remove any inherited bots.
-            Server.ExecuteCommand("mp_autoteambalance 0");
-            Server.ExecuteCommand("mp_limitteams 0");
-            Server.ExecuteCommand("bot_quota_mode fill");
-            Server.ExecuteCommand("bot_quota 0");
-            Server.ExecuteCommand("bot_kick all");
-            Logger.LogInformation("Post-switch BOT population reset completed for {Mode}", targetMode.Alias);
+            if (resetBots)
+            {
+                Server.ExecuteCommand("mp_ignore_round_win_conditions 0");
+                Server.ExecuteCommand("mp_autoteambalance 0");
+                Server.ExecuteCommand("mp_limitteams 0");
+                Server.ExecuteCommand("bot_quota_mode fill");
+                Server.ExecuteCommand("bot_quota 0");
+                Server.ExecuteCommand("bot_kick all");
+                Logger.LogInformation("Post-switch vanilla restore completed for {Label}", pending.Label);
+            }
+
+            foreach (var command in pending.After)
+            {
+                Server.ExecuteCommand(command);
+                Logger.LogInformation("Post-switch command for {Label}: {Command}", pending.Label, command);
+            }
         }, TimerFlags.STOP_ON_MAPCHANGE);
     }
 
@@ -298,15 +631,35 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     {
         foreach (var player in Utilities.GetPlayers())
         {
-            if (!player.IsValid || !_menuStates.TryGetValue(player.Slot, out var state) || state.ActiveMenu == null)
+            if (!player.IsValid || player.IsBot)
                 continue;
 
-            ProcessMenuInput(player, state, player.Buttons);
-            RenderMenu(player, state);
+            if (_menuStates.TryGetValue(player.Slot, out var state) && state.ActiveMenu != null)
+            {
+                ProcessMenuInput(player, state, player.Buttons);
+                RenderMenu(player, state);
 
-            if (state.ActiveMenu != null && player.PlayerPawn?.Value != null)
-                player.PlayerPawn.Value.VelocityModifier = 0f;
+                if (state.ActiveMenu != null && player.PlayerPawn?.Value != null)
+                    player.PlayerPawn.Value.VelocityModifier = 0f;
+                continue;
+            }
+
+            RenderSwitchCountdown(player);
         }
+    }
+
+    private void RenderSwitchCountdown(CCSPlayerController player)
+    {
+        if (_countdownLabel == null || _countdownRemaining <= 0)
+            return;
+
+        player.PrintToCenterHtml(T(player, "Switch.Countdown", _countdownLabel, _countdownRemaining));
+    }
+
+    private void ClearCountdown()
+    {
+        _countdownLabel = null;
+        _countdownRemaining = 0;
     }
 
     private void ProcessMenuInput(CCSPlayerController player, SgMenuState state, PlayerButtons buttons)
@@ -505,49 +858,12 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         "Switch.Countdown" => "即将切换到 <font color='#9acd32'>{0}</font><br>{1} 秒后更换地图",
         "Switch.Executing" => "正在切换到 {yellow}{0}{default}，地图加载中...",
         "Menu.Title" => "选择游戏模式",
-        "Menu.ModeTitle" => "选择模式",
-        "Menu.MapTitle" => "选择 {0} 的地图",
-        "ModeGroup.Classic" => "经典模式",
-        "ModeGroup.Wingman" => "搭档模式",
-        "ModeGroup.Retakes" => "回防模式",
-        "ModeGroup.WarGames" => "战争游戏模式",
-        "ModeGroup.Other" => "其他模式",
         "Menu.Current" => "（当前）",
+        "Menu.NoPresets" => "未配置预设",
         "Menu.Control.Move" => "移动",
         "Menu.Control.Select" => "确认",
         "Menu.Control.Back" => "返回",
         "Menu.Control.Exit" => "退出",
-        "Mode.Casual" => "休闲模式",
-        "Mode.Competitive" => "竞技模式",
-        "Mode.Wingman" => "搭档模式",
-        "Mode.Retakes" => "回防模式",
-        "Mode.ArmsRace" => "军备竞赛",
-        "Mode.Demolition" => "爆破模式",
-        "Mode.Deathmatch" => "死亡竞赛",
-        "Mode.Training" => "训练",
-        "Mode.Custom" => "自定义",
-        "Map.de_cache" => "死城之谜",
-        "Map.de_dust2" => "炙热沙城 II",
-        "Map.de_mirage" => "荒漠迷城",
-        "Map.de_inferno" => "炼狱小镇",
-        "Map.de_nuke" => "核子危机",
-        "Map.de_overpass" => "死亡游乐园",
-        "Map.de_ancient" => "远古遗迹",
-        "Map.de_anubis" => "阿努比斯",
-        "Map.de_vertigo" => "殒命大厦",
-        "Map.de_lake" => "湖畔",
-        "Map.de_debris" => "残翼小镇",
-        "Map.de_eldorado" => "黄金之城",
-        "Map.de_poseidon" => "波塞冬",
-        "Map.de_boulder" => "岩岛修道院",
-        "Map.de_fachwerk" => "木筋屋小镇",
-        "Map.cs_shelter" => "动物收容所",
-        "Map.de_train" => "列车停放站",
-        "Map.de_ancient_night" => "远古遗迹",
-        "Map.ar_baggage" => "行李仓库",
-        "Map.ar_shoots" => "山林小寨",
-        "Map.ar_shoots_night" => "山林夜寨",
-        "Map.ar_pool_day" => "泳池派对",
         _ => key,
     };
 
@@ -560,49 +876,12 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         "Switch.Countdown" => "Switching to <font color='#9acd32'>{0}</font><br>Changing map in {1}s",
         "Switch.Executing" => "Switching to {yellow}{0}{default}, loading map...",
         "Menu.Title" => "Select Game Mode",
-        "Menu.ModeTitle" => "Select Mode",
-        "Menu.MapTitle" => "Select a map for {0}",
-        "ModeGroup.Classic" => "Classic Mode",
-        "ModeGroup.Wingman" => "Wingman",
-        "ModeGroup.Retakes" => "Retakes",
-        "ModeGroup.WarGames" => "War Games",
-        "ModeGroup.Other" => "Other Modes",
         "Menu.Current" => " (current)",
+        "Menu.NoPresets" => "No presets configured",
         "Menu.Control.Move" => "Move",
         "Menu.Control.Select" => "Select",
         "Menu.Control.Back" => "Back",
         "Menu.Control.Exit" => "Exit",
-        "Mode.Casual" => "Casual",
-        "Mode.Competitive" => "Competitive",
-        "Mode.Wingman" => "Wingman",
-        "Mode.Retakes" => "Retakes",
-        "Mode.ArmsRace" => "Arms Race",
-        "Mode.Demolition" => "Demolition",
-        "Mode.Deathmatch" => "Deathmatch",
-        "Mode.Training" => "Training",
-        "Mode.Custom" => "Custom",
-        "Map.de_cache" => "Cache",
-        "Map.de_dust2" => "Dust II",
-        "Map.de_mirage" => "Mirage",
-        "Map.de_inferno" => "Inferno",
-        "Map.de_nuke" => "Nuke",
-        "Map.de_overpass" => "Overpass",
-        "Map.de_ancient" => "Ancient",
-        "Map.de_anubis" => "Anubis",
-        "Map.de_vertigo" => "Vertigo",
-        "Map.de_lake" => "Lake",
-        "Map.de_debris" => "Debris",
-        "Map.de_eldorado" => "Eldorado",
-        "Map.de_poseidon" => "Poseidon",
-        "Map.de_boulder" => "Boulder",
-        "Map.de_fachwerk" => "Fachwerk",
-        "Map.cs_shelter" => "Shelter",
-        "Map.de_train" => "Train",
-        "Map.de_ancient_night" => "Ancient",
-        "Map.ar_baggage" => "Baggage",
-        "Map.ar_shoots" => "Shoots",
-        "Map.ar_shoots_night" => "Shoots Night",
-        "Map.ar_pool_day" => "Pool Day",
         _ => key,
     };
 
@@ -615,14 +894,6 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         }
     }
 
-    private void BroadcastCenter(Func<CCSPlayerController, string> messageFor)
-    {
-        foreach (var player in Utilities.GetPlayers())
-        {
-            if (player.IsValid && !player.IsBot)
-                player.PrintToCenterHtml(messageFor(player));
-        }
-    }
 }
 
 internal sealed class SgMenu
@@ -657,27 +928,11 @@ internal sealed class SgMenuState
     public DateTime LastInputUtc { get; set; }
 }
 
-internal sealed record ModeDefinition(
-    string Alias,
-    int Type,
-    int Mode,
-    string LangKey,
-    string[] Maps)
-{
-    public string GroupKey => Alias switch
-    {
-        "casual" or "competitive" => "ModeGroup.Classic",
-        "wingman" => "ModeGroup.Wingman",
-        "retakes" => "ModeGroup.Retakes",
-        "armsrace" or "demolition" or "deathmatch" => "ModeGroup.WarGames",
-        _ => "ModeGroup.Other",
-    };
-
-}
-
-internal sealed record MapDefinition(string Name)
-{
-    public string LangKey => $"Map.{Name}";
-}
-
-internal sealed record PendingSwitch(ModeDefinition Mode, string MapName);
+internal sealed record PendingSwitch(
+    string Label,
+    int GameType,
+    int GameMode,
+    string GameAlias,
+    string Map,
+    bool ResetBots,
+    string[] After);
