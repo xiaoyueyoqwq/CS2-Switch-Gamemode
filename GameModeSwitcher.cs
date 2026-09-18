@@ -17,7 +17,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     public override string ModuleName => "[CS2-Switch-Gamemode]";
     public override string ModuleDescription => "In-game game mode switcher driven by JSON presets";
     public override string ModuleAuthor => "xiaoyueyoqwq";
-    public override string ModuleVersion => "1.3.4";
+    public override string ModuleVersion => "1.3.8";
 
     public GameModeSwitcherConfig Config { get; set; } = new();
 
@@ -26,9 +26,13 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     private static readonly TimeSpan MenuInputDebounce = TimeSpan.FromMilliseconds(120);
 
     private readonly Dictionary<int, SgMenuState> _menuStates = new();
-    private readonly Dictionary<int, float> _savedSpeeds = new();
+    // Keyed by the menu opener's controller slot. Takeover can switch
+    // which pawn that controller occupies, so we snapshot per pawn Index.
+    private readonly Dictionary<int, Dictionary<uint, FrozenPawnState>> _savedMenuFreeze = new();
+    private readonly Dictionary<int, int> _possessedBotSlot = new();
     private PendingSwitch? _pendingSwitch;
     private (int Type, int Mode)? _confirmedMode;
+    private string _settledToggleProfile = "";
     private bool _switchInProgress;
     private bool _worldApplyArmed;
     private int _switchGeneration;
@@ -52,8 +56,12 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             AddCommand("gamemode", "Open game mode switcher", OnGamemodeCommand);
 
         RegisterListener<Listeners.OnTick>(OnMenuTick);
+        RegisterListener<Listeners.OnServerPreEntityThink>(OnMenuPreEntityThink);
         RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
+        RegisterEventHandler<EventBotTakeover>(OnBotTakeover);
+        RegisterEventHandler<EventRoundPrestart>(OnRoundPrestart);
+        RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn, HookMode.Pre);
         Logger.LogInformation("Loaded (version {Version}, {Count} presets)", ModuleVersion, Config.Presets.Length);
     }
 
@@ -62,6 +70,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         ClearCountdown();
         DisarmWorldApply();
         RemoveListener<Listeners.OnTick>(OnMenuTick);
+        RemoveListener<Listeners.OnServerPreEntityThink>(OnMenuPreEntityThink);
         RemoveListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
         RemoveListener<Listeners.OnMapStart>(OnMapStart);
         RemoveCommand(Config.MenuCommand, OnGamemodeCommand);
@@ -91,7 +100,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             foreach (var preset in Config.Presets)
             {
                 command.ReplyToCommand(
-                    $"{preset.Group} / {preset.Label} = game_type {preset.GameType} game_mode {preset.GameMode} alias {preset.GameAlias} map {preset.Map} via {BuildMapCommand(preset.Map)}");
+                    $"{preset.Group} / {preset.Label} = game_type {preset.GameType} game_mode {preset.GameMode} alias {preset.GameAlias} map {preset.Map} profile {preset.ToggleProfile} via {BuildMapCommand(preset.Map)}");
             }
             return;
         }
@@ -162,6 +171,8 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             return false;
         if (current.Value.Type != preset.GameType || current.Value.Mode != preset.GameMode)
             return false;
+        if (!string.Equals(preset.ToggleProfile, _settledToggleProfile, StringComparison.OrdinalIgnoreCase))
+            return false;
 
         return MapReached(Server.MapName, preset.Map);
     }
@@ -186,8 +197,9 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         {
             var mapCommand = BuildMapCommand(pending.Map);
             Logger.LogInformation(
-                "Executing switch to {Label} (game_type {Type} game_mode {GameMode} alias {Alias}) map {Map} via {MapCommand}",
-                pending.Label, pending.GameType, pending.GameMode, pending.GameAlias, pending.Map, mapCommand);
+                "Executing switch to {Label} (game_type {Type} game_mode {GameMode} alias {Alias}) map {Map} profile {Profile} via {MapCommand}",
+                pending.Label, pending.GameType, pending.GameMode, pending.GameAlias, pending.Map, pending.ToggleProfile, mapCommand);
+            SendToggleProfile(pending.ToggleProfile);
             Server.ExecuteCommand($"game_type {pending.GameType}");
             Server.ExecuteCommand($"game_mode {pending.GameMode}");
             Server.ExecuteCommand(mapCommand);
@@ -243,7 +255,8 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             preset.GameAlias,
             preset.Map,
             preset.ResetBots,
-            [.. preset.After]);
+            [.. preset.After],
+            preset.ToggleProfile);
     }
 
     // ---- menu ----
@@ -302,24 +315,101 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     {
         var menu = new SgMenu(group);
         var currentSuffix = T(player, "Menu.Current");
+        var subGroups = new List<string>();
+        var leaves = new List<GameModePreset>();
+
         foreach (var preset in Config.Presets)
         {
             if (!string.Equals(preset.Group, group, StringComparison.Ordinal))
                 continue;
 
-            var target = preset;
-            var text = IsCurrentPreset(target) ? target.Label + currentSuffix : target.Label;
-            menu.Options.Add(new SgMenuOption(text, p =>
+            var subGroup = preset.ResolvedSubGroup();
+            if (subGroup.Length == 0)
             {
-                if (!_switchInProgress)
-                    BeginSwitch(p, target);
-            }));
+                leaves.Add(preset);
+                continue;
+            }
+
+            if (!subGroups.Exists(existing => string.Equals(existing, subGroup, StringComparison.Ordinal)))
+                subGroups.Add(subGroup);
+        }
+
+        if (subGroups.Count == 0)
+        {
+            foreach (var preset in Config.Presets)
+            {
+                if (!string.Equals(preset.Group, group, StringComparison.Ordinal))
+                    continue;
+                AddPresetOption(menu, preset, currentSuffix, stripPrefix: false);
+            }
+        }
+        else
+        {
+            foreach (var subGroup in subGroups)
+            {
+                var captured = subGroup;
+                var hasCurrent = false;
+                foreach (var preset in Config.Presets)
+                {
+                    if (!string.Equals(preset.Group, group, StringComparison.Ordinal))
+                        continue;
+                    if (!string.Equals(preset.ResolvedSubGroup(), captured, StringComparison.Ordinal))
+                        continue;
+                    if (IsCurrentPreset(preset))
+                    {
+                        hasCurrent = true;
+                        break;
+                    }
+                }
+
+                var text = hasCurrent ? captured + currentSuffix : captured;
+                menu.Options.Add(new SgMenuOption(text, p => OpenSubGroupMenu(p, group, captured)));
+            }
+
+            foreach (var leaf in leaves)
+                AddPresetOption(menu, leaf, currentSuffix, stripPrefix: false);
         }
 
         if (menu.Options.Count == 0)
             menu.Options.Add(new SgMenuOption(T(player, "Menu.NoPresets"), _ => { }, disabled: true));
 
         OpenMenu(player, menu);
+    }
+
+    private void OpenSubGroupMenu(CCSPlayerController player, string group, string subGroup)
+    {
+        var menu = new SgMenu($"{group} / {subGroup}");
+        var currentSuffix = T(player, "Menu.Current");
+        foreach (var preset in Config.Presets)
+        {
+            if (!string.Equals(preset.Group, group, StringComparison.Ordinal))
+                continue;
+            if (!string.Equals(preset.ResolvedSubGroup(), subGroup, StringComparison.Ordinal))
+                continue;
+            AddPresetOption(menu, preset, currentSuffix, stripPrefix: true);
+        }
+
+        if (menu.Options.Count == 0)
+            menu.Options.Add(new SgMenuOption(T(player, "Menu.NoPresets"), _ => { }, disabled: true));
+
+        OpenMenu(player, menu);
+    }
+
+    private void AddPresetOption(
+        SgMenu menu,
+        GameModePreset preset,
+        string currentSuffix,
+        bool stripPrefix)
+    {
+        var target = preset;
+        var text = stripPrefix ? target.MenuDisplayName() : target.Label;
+        if (IsCurrentPreset(target))
+            text += currentSuffix;
+        menu.Options.Add(new SgMenuOption(text, p =>
+        {
+            if (!_switchInProgress)
+                BeginSwitch(p, target);
+        }));
     }
 
     private SgMenuState GetMenuState(CCSPlayerController player)
@@ -336,7 +426,10 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
     private void OnClientDisconnect(int slot)
     {
         _menuStates.Remove(slot);
-        _savedSpeeds.Remove(slot);
+        _savedMenuFreeze.Remove(slot);
+        _possessedBotSlot.Remove(slot);
+        foreach (var pair in _possessedBotSlot.Where(p => p.Value == slot).Select(p => p.Key).ToList())
+            _possessedBotSlot.Remove(pair);
     }
 
     private void OnMapStart(string mapName)
@@ -401,6 +494,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             _pendingSwitch = null;
             _modeApplyRetries = 0;
             _confirmedMode = current;
+            _settledToggleProfile = pending.ToggleProfile;
             SchedulePostSwitch(pending);
             return;
         }
@@ -422,6 +516,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
         _pendingSwitch = null;
         _modeApplyRetries = 0;
+        SendToggleProfile(_settledToggleProfile);
         Logger.LogWarning(
             "Mode switch did not reach target mode/map (target {Label}/{Type}/{GameMode}/{Map}, loaded {LoadedType}/{LoadedMode}/{LoadedMap})",
             pending.Label, pending.GameType, pending.GameMode, pending.Map,
@@ -483,6 +578,7 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
             _modeApplyRetries = 0;
             if (current.HasValue)
                 _confirmedMode = current;
+            _settledToggleProfile = pending.ToggleProfile;
             SchedulePostSwitch(pending);
         });
     }
@@ -553,6 +649,12 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
         fileId = idPart;
         return true;
+    }
+
+    private static void SendToggleProfile(string profile)
+    {
+        var profileArg = string.IsNullOrEmpty(profile) ? "-" : profile;
+        Server.ExecuteCommand($"css_plugintoggle profile {profileArg}");
     }
 
     public static string BuildMapCommand(string map)
@@ -636,16 +738,71 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
 
             if (_menuStates.TryGetValue(player.Slot, out var state) && state.ActiveMenu != null)
             {
-                ProcessMenuInput(player, state, player.Buttons);
-                RenderMenu(player, state);
+                // Buttons is Pawn.Value.MovementServices.Buttons. After kicking
+                // a possessed bot that pawn can already be gone.
+                if (player.Pawn?.Value?.MovementServices is null)
+                {
+                    CloseMenu(player);
+                    continue;
+                }
 
-                if (state.ActiveMenu != null && player.PlayerPawn?.Value != null)
-                    player.PlayerPawn.Value.VelocityModifier = 0f;
+                PlayerButtons buttons;
+                try
+                {
+                    buttons = player.Buttons;
+                }
+                catch
+                {
+                    CloseMenu(player);
+                    continue;
+                }
+
+                ProcessMenuInput(player, state, buttons);
+                RenderMenu(player, state);
+                if (state.ActiveMenu != null)
+                    SetFrozen(player, true, stripWish: true);
                 continue;
             }
 
             RenderSwitchCountdown(player);
         }
+    }
+
+    private void OnMenuPreEntityThink()
+    {
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (!player.IsValid || !_menuStates.TryGetValue(player.Slot, out var state) || state.ActiveMenu == null)
+                continue;
+
+            SetFrozen(player, true, stripWish: false);
+        }
+    }
+
+    private HookResult OnBotTakeover(EventBotTakeover ev, GameEventInfo info)
+    {
+        var human = ev.Userid;
+        var bot = ev.Botid;
+        if (human is not { IsValid: true } || bot is not { IsValid: true })
+            return HookResult.Continue;
+
+        _possessedBotSlot[human.Slot] = bot.Slot;
+        return HookResult.Continue;
+    }
+
+    private HookResult OnRoundPrestart(EventRoundPrestart ev, GameEventInfo info)
+    {
+        CloseAllMenus();
+        return HookResult.Continue;
+    }
+
+    private HookResult OnPlayerSpawn(EventPlayerSpawn ev, GameEventInfo info)
+    {
+        var player = ev.Userid;
+        if (player is { IsValid: true })
+            CloseMenu(player);
+
+        return HookResult.Continue;
     }
 
     private void RenderSwitchCountdown(CCSPlayerController player)
@@ -742,6 +899,15 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         state.LastInputUtc = state.OpenedAtUtc;
     }
 
+    private void CloseAllMenus()
+    {
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (player is { IsValid: true })
+                CloseMenu(player);
+        }
+    }
+
     private void CloseMenu(CCSPlayerController player)
     {
         if (_menuStates.TryGetValue(player.Slot, out var state))
@@ -792,25 +958,226 @@ public sealed class GameModeSwitcher : BasePlugin, IPluginConfig<GameModeSwitche
         player.PrintToCenterHtml(builder.ToString());
     }
 
-    private void SetFrozen(CCSPlayerController player, bool frozen)
+    private void SetFrozen(CCSPlayerController player, bool frozen, bool stripWish = false)
     {
-        var pawn = player.PlayerPawn?.Value;
-        if (pawn == null)
-            return;
-
-        if (frozen)
+        // Takeover applies the occupant's usercmd to Pawn before OnTick, so
+        // writing VelocityModifier there never sees the walk. PreEntityThink
+        // sets MOVETYPE_NONE and pins origin. Do not clear buttons in
+        // PreEntityThink: the menu reads W/S on OnTick.
+        try
         {
-            if (!_savedSpeeds.ContainsKey(player.Slot))
-                _savedSpeeds[player.Slot] = pawn.VelocityModifier;
-            pawn.VelocityModifier = 0f;
-            return;
+            var pawns = OccupiedPawns(player);
+            if (frozen)
+            {
+                if (!_savedMenuFreeze.TryGetValue(player.Slot, out var saved))
+                {
+                    saved = new Dictionary<uint, FrozenPawnState>();
+                    _savedMenuFreeze[player.Slot] = saved;
+                }
+
+                foreach (var pawn in pawns)
+                {
+                    if (!saved.TryGetValue(pawn.Index, out var state))
+                    {
+                        state = SnapshotPawn(pawn);
+                        saved[pawn.Index] = state;
+                    }
+
+                    ImmobilizePawn(pawn, state);
+                    if (stripWish)
+                        StripWish(pawn);
+                }
+
+                return;
+            }
+
+            if (_savedMenuFreeze.TryGetValue(player.Slot, out var restore))
+            {
+                foreach (var pawn in pawns)
+                {
+                    if (restore.TryGetValue(pawn.Index, out var state))
+                        RestorePawn(pawn, state);
+                }
+
+                _savedMenuFreeze.Remove(player.Slot);
+            }
+        }
+        catch
+        {
+            // Occupied pawn can vanish mid-takeover; do not take down OnTick.
+        }
+    }
+
+    private List<CBasePlayerPawn> OccupiedPawns(CCSPlayerController player)
+    {
+        var pawns = new List<CBasePlayerPawn>(4);
+        AddPawn(pawns, player.Pawn?.Value);
+        AddPawn(pawns, player.PlayerPawn?.Value);
+        try
+        {
+            AddPawn(pawns, player.ObserverPawn?.Value);
+        }
+        catch
+        {
+            // Observer pawn is optional.
         }
 
-        if (_savedSpeeds.TryGetValue(player.Slot, out var speed))
+        try
         {
-            pawn.VelocityModifier = speed;
-            _savedSpeeds.Remove(player.Slot);
+            var original = player.OriginalControllerOfCurrentPawn.Value;
+            if (original != null && original.IsValid && original.Slot != player.Slot)
+            {
+                AddPawn(pawns, original.Pawn?.Value);
+                AddPawn(pawns, original.PlayerPawn?.Value);
+            }
         }
+        catch
+        {
+            // Occupancy handle can be unreadable during inverted takeover.
+        }
+
+        if (_possessedBotSlot.TryGetValue(player.Slot, out var botSlot))
+        {
+            var bot = Utilities.GetPlayerFromSlot(botSlot);
+            if (bot != null && bot.IsValid)
+            {
+                AddPawn(pawns, bot.Pawn?.Value);
+                AddPawn(pawns, bot.PlayerPawn?.Value);
+            }
+        }
+
+        foreach (var other in Utilities.GetPlayers())
+        {
+            if (other == null || !other.IsValid || other.Slot == player.Slot)
+                continue;
+
+            try
+            {
+                var body = other.PlayerPawn?.Value;
+                if (body == null || !body.IsValid)
+                    continue;
+
+                if (body.Controller?.Value is CCSPlayerController occupier
+                    && occupier.IsValid
+                    && occupier.Slot == player.Slot)
+                {
+                    AddPawn(pawns, body);
+                }
+            }
+            catch
+            {
+                // Skip this candidate; other sources still apply.
+            }
+        }
+
+        return pawns;
+    }
+
+    private static void AddPawn(List<CBasePlayerPawn> pawns, CBasePlayerPawn? pawn)
+    {
+        if (pawn == null || !pawn.IsValid)
+            return;
+
+        foreach (var existing in pawns)
+        {
+            if (existing.Index == pawn.Index)
+                return;
+        }
+
+        pawns.Add(pawn);
+    }
+
+    private static FrozenPawnState SnapshotPawn(CBasePlayerPawn pawn)
+    {
+        var origin = pawn.AbsOrigin;
+        return new FrozenPawnState
+        {
+            MoveType = pawn.MoveType,
+            ActualMoveType = pawn.ActualMoveType,
+            OriginX = origin?.X ?? 0f,
+            OriginY = origin?.Y ?? 0f,
+            OriginZ = origin?.Z ?? 0f,
+        };
+    }
+
+    private static void ImmobilizePawn(CBasePlayerPawn pawn, FrozenPawnState state)
+    {
+        pawn.MoveType = MoveType_t.MOVETYPE_NONE;
+        pawn.ActualMoveType = MoveType_t.MOVETYPE_NONE;
+        try
+        {
+            Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
+            Utilities.SetStateChanged(pawn, "CBaseEntity", "m_nActualMoveType");
+        }
+        catch
+        {
+            // Schema mark is best-effort; MOVETYPE_NONE still applies server-side.
+        }
+
+        try
+        {
+            // Null angles: rewriting AbsRotation every think overwrites mouse look.
+            pawn.Teleport(
+                new System.Numerics.Vector3(state.OriginX, state.OriginY, state.OriginZ),
+                null,
+                new System.Numerics.Vector3(0f, 0f, 0f));
+        }
+        catch
+        {
+            // Pawn can be mid-swap during takeover.
+        }
+    }
+
+    private static void StripWish(CBasePlayerPawn pawn)
+    {
+        try
+        {
+            if (pawn.MovementServices is not CPlayer_MovementServices movement)
+                return;
+
+            var states = movement.Buttons.ButtonStates;
+            if (states.Length > 0)
+                states[0] &= ~MovementButtonMask;
+
+            movement.ForwardMove = 0f;
+            movement.LeftMove = 0f;
+            movement.UpMove = 0f;
+            movement.CmdForwardMove = 0f;
+            movement.CmdLeftMove = 0f;
+            movement.CmdUpMove = 0f;
+        }
+        catch
+        {
+            // Menu already consumed this tick's buttons.
+        }
+    }
+
+    private static void RestorePawn(CBasePlayerPawn pawn, FrozenPawnState state)
+    {
+        pawn.MoveType = state.MoveType;
+        pawn.ActualMoveType = state.ActualMoveType;
+        try
+        {
+            Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
+            Utilities.SetStateChanged(pawn, "CBaseEntity", "m_nActualMoveType");
+        }
+        catch
+        {
+            // Restore write still happened even if the mark failed.
+        }
+    }
+
+    private static readonly ulong MovementButtonMask =
+        (ulong)(PlayerButtons.Forward | PlayerButtons.Back | PlayerButtons.Moveleft
+            | PlayerButtons.Moveright | PlayerButtons.Jump | PlayerButtons.Duck | PlayerButtons.Speed);
+
+    private readonly struct FrozenPawnState
+    {
+        public MoveType_t MoveType { get; init; }
+        public MoveType_t ActualMoveType { get; init; }
+        public float OriginX { get; init; }
+        public float OriginY { get; init; }
+        public float OriginZ { get; init; }
     }
 
     private static int FirstSelectableIndex(SgMenu? menu, int fallback)
@@ -935,4 +1302,5 @@ internal sealed record PendingSwitch(
     string GameAlias,
     string Map,
     bool ResetBots,
-    string[] After);
+    string[] After,
+    string ToggleProfile);

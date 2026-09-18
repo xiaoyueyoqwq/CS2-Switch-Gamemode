@@ -57,6 +57,7 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
                 group = "其他模式";
 
             preset.Group = group;
+            preset.SubGroup = preset.SubGroup?.Trim() ?? string.Empty;
             preset.Label = label;
             preset.Map = map;
             preset.GameAlias = preset.GameAlias?.Trim() ?? string.Empty;
@@ -64,6 +65,7 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
                 .Select(command => command?.Trim() ?? string.Empty)
                 .Where(command => command.Length > 0)
                 .ToArray();
+            preset.ToggleProfile = preset.ToggleProfile?.Trim() ?? string.Empty;
             kept.Add(preset);
         }
 
@@ -95,8 +97,8 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
 
         AddRange(presets, "经典模式", "休闲", "casual", 0, 0, classicMaps, includeModeInLabel: true);
         AddRange(presets, "经典模式", "竞技", "competitive", 0, 1, classicMaps, includeModeInLabel: true);
-        AddRange(presets, "搭档模式", "搭档", "wingman", 0, 2, wingmanMaps, includeModeInLabel: false);
-        AddRange(presets, "回防模式", "回防", "retakes", 0, 5, retakesMaps, includeModeInLabel: false);
+        AddRange(presets, "经典模式", "搭档", "wingman", 0, 2, wingmanMaps, includeModeInLabel: false);
+        AddRange(presets, "经典模式", "回防", "retakes", 0, 5, retakesMaps, includeModeInLabel: false);
         AddRange(presets, "战争游戏模式", "军备竞赛", "armsrace", 1, 0, armsRaceMaps, includeModeInLabel: true);
         AddRange(presets, "战争游戏模式", "爆破", "demolition", 1, 1, ["de_safehouse"], includeModeInLabel: true);
         AddRange(presets, "战争游戏模式", "死亡竞赛", "deathmatch", 1, 2, classicMaps, includeModeInLabel: true);
@@ -121,6 +123,7 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
             presets.Add(new GameModePreset
             {
                 Group = group,
+                SubGroup = modeLabel,
                 Label = includeModeInLabel ? $"{modeLabel} {mapLabel}" : mapLabel,
                 GameType = type,
                 GameMode = mode,
@@ -164,12 +167,58 @@ public sealed class GameModeSwitcherConfig : BasePluginConfig
 
 public sealed class GameModePreset
 {
+    /// <summary>
+    /// Known Label prefixes that become a second menu level under Group.
+    /// Longest first so 军备竞赛 / 死亡竞赛 win over shorter tokens.
+    /// </summary>
+    public static readonly string[] KnownSubGroupPrefixes =
+    [
+        "军备竞赛",
+        "死亡竞赛",
+        "爆破",
+        "休闲",
+        "竞技",
+        "训练",
+    ];
+
     public string Group { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional second-level heading. Empty uses a KnownSubGroupPrefixes match on Label.
+    /// </summary>
+    public string SubGroup { get; set; } = string.Empty;
+
     public string Label { get; set; } = string.Empty;
+
+    public string ResolvedSubGroup()
+    {
+        if (SubGroup.Length > 0)
+            return SubGroup;
+
+        foreach (var prefix in KnownSubGroupPrefixes)
+        {
+            if (Label.StartsWith(prefix + " ", StringComparison.Ordinal))
+                return prefix;
+        }
+
+        return string.Empty;
+    }
+
+    public string MenuDisplayName()
+    {
+        var subGroup = ResolvedSubGroup();
+        if (subGroup.Length > 0 && Label.StartsWith(subGroup + " ", StringComparison.Ordinal))
+            return Label[(subGroup.Length + 1)..];
+        return Label;
+    }
+
     public int GameType { get; set; }
     public int GameMode { get; set; }
     public string GameAlias { get; set; } = string.Empty;
     public string Map { get; set; } = string.Empty;
     public bool ResetBots { get; set; } = true;
     public string[] After { get; set; } = [];
+
+    /// <summary>Optional PluginToggle profile name. Empty leaves the profile cleared.</summary>
+    public string ToggleProfile { get; set; } = string.Empty;
 }
