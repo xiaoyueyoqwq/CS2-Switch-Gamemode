@@ -113,49 +113,6 @@ A missing `Presets` key (plugin upgrade) is filled with the default vanilla tabl
 
 The first-run / upgrade default contains the previous vanilla pools (Casual, Competitive, Wingman, Retakes, Arms Race, Demolition, Deathmatch, Training) and no workshop maps. Add workshop rows yourself.
 
-## BotHider compatibility with voting and bot population plugins
-
-BotHider's `identity_mode` changes how the engine identifies managed bots.
-
-With the default `player` mode, BotHider clears part of Valve's native
-fake-client state, so bots appear more like real players at the engine level.
-This affects native vote counts, `bot_quota` and bot population maintenance,
-`bot_kick`/`bot_add`, player-count checks during map changes, and any other
-plugin that relies on `IsBot` or the native fake-client state. This is an engine
-identity change, not only a scoreboard display change; Valve and other plugins
-may classify the bot as a human before BotHider can adjust it.
-
-The project previously attempted to compensate for `player` mode by listening
-to native vote events and temporarily restoring bot identity. That approach was
-removed because vote-event ordering, native vtable locations, map transitions,
-entity destruction, and overlapping population management can vary by CS2
-version and plugin. Keeping those global hooks would risk vote failures, broken
-map transitions, or server crashes.
-
-### Recommended BotHider configuration
-
-When using CS2-Vote-Improver or another plugin that reads player counts or
-manages bots, keep Valve's native bot identity:
-
-```json
-{
-  "identity_mode": "bot"
-}
-```
-
-The actual configuration value is `"bot"`. Keeping the native bot
-identity avoids the engine-level problems caused by `identity_mode: "player"`.
-
-Plugins that handle votes, player counts, `bot_quota`, map changes, or bot
-creation/removal should use Valve's native bot flag as the identity source.
-After a plugin-initiated switch, CS2-Switch-Gamemode may reassert `bot_quota 0`
-and kick inherited bots; it does not run a continuous team-balance loop.
-Scoreboard appearance is not proof that a client is a human, and multiple
-plugins should not run independent `bot_quota`, `bot_kick`, or `bot_add` loops
-over the same map-change lifecycle. `identity_mode: "player"` remains suitable
-for display-only use cases, but should not be combined with plugins that depend
-on native player identity or bot population state.
-
 ## Building
 
 Requires the .NET 10 SDK:
@@ -259,45 +216,3 @@ dotnet build -c Release
 ```
 
 部署时只需 `CS2-Switch-Gamemode.dll`、`.deps.json`、`.pdb` 与 `lang/` 目录。
-
-### BotHider 与投票、人口管理插件的兼容性说明
-
-BotHider 的 `identity_mode` 会影响引擎识别托管 BOT 的方式。
-
-在默认的 `player` 模式下，BotHider 会清除部分 Valve 原生的 fake-client
-标志，使 BOT 在引擎层看起来更像真实玩家。这会影响原生投票的有效投票人数
-计算、`bot_quota` 和 BOT 人口维护、`bot_kick`/`bot_add` 命令结果、换图时的
-玩家数量检测，以及其他依赖 `IsBot` 或原生 fake-client 状态的插件。这不是
-单纯的记分板显示变化：在 BotHider 有机会修正之前，Valve 和其他插件可能已经
-把这些 BOT 当作真人处理。
-
-项目曾尝试通过监听原生投票事件、临时恢复 BOT 身份来兼容 `player` 模式。由于
-投票事件顺序与实际投票状态建立过程存在时序差异，native vtable 和函数调用位置
-依赖具体 CS2 版本，换图、卸载和实体销毁期间还可能发生竞态，并且可能覆盖其他
-插件的人口管理逻辑，无法同时保证投票、换图和 BOT 人口操作的完整生命周期。这类
-全局兼容钩子已经移除，避免为修复投票问题引入更严重的投票、换图或服务器崩溃风险。
-
-#### 推荐配置
-
-与 CS2-Vote-Improver 或其他读取玩家数量、管理 BOT 人口的插件一起使用时，请保留
-Valve 的原生 BOT 身份：
-
-```json
-{
-  "identity_mode": "bot"
-}
-```
-
-配置文件中的实际值是 `"bot"`。保留原生 BOT 身份可以避免
-`identity_mode: "player"` 带来的引擎身份问题。
-
-#### 维护插件时的原则
-
-涉及投票、玩家数量、`bot_quota`、换图或 BOT 增删的插件，应优先使用 Valve 的原生
-BOT 标志作为身份来源。不要假设记分板上看起来像真人的客户端一定是真人，也不要在
-换图生命周期中同时执行多套 `bot_quota`、`bot_kick` 和 `bot_add` 逻辑。
-
-插件发起的切换成功后，CS2-Switch-Gamemode 可能重申 `bot_quota 0` 并踢掉继承 BOT，但不跑持续的队伍平衡循环。
-
-`identity_mode: "player"` 仍可用于只关注外观显示的场景，但不应与依赖原生玩家身份
-或 BOT 人口状态的插件组合使用。
